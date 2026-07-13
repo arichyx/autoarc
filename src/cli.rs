@@ -39,6 +39,45 @@ pub struct Args {
     #[arg(short, long, default_value_t = false)]
     pub recursive: bool,
 
+    /// Glob patterns of paths to skip during the initial directory scan.
+    ///
+    /// Repeatable; a path is ignored when it matches **any** pattern. Each
+    /// `--ignore` occurrence is exactly one pattern — comma-separated lists
+    /// are *not* split here (a glob may contain a comma inside `{a,b}`
+    /// alternation, e.g. `--ignore '**/*.{tmp,bak}'`).
+    ///
+    /// Patterns are matched against the path relative to `<DIR>` and are
+    /// fully anchored — the whole relative path must match. With shell-style
+    /// globbing where `*` stays within a single path component:
+    ///
+    /// - `*` never crosses `/`
+    /// - `**` crosses any number of directory separators
+    /// - `{a,b}` alternation and `[abc]` character classes are supported
+    ///
+    /// ```text
+    /// --ignore scratch              # skip top-level scratch/ and its subtree
+    /// --ignore '**/node_modules'    # skip node_modules/ at any depth
+    /// --ignore '*.tmp'              # skip *.tmp at the top level only
+    /// --ignore '**/*.tmp'           # skip *.tmp at any depth
+    /// ```
+    ///
+    /// Matching a directory prunes its entire subtree. Only the **initial**
+    /// scan is affected — archives produced *by* extraction are still queued
+    /// recursively, regardless of `--ignore` (same scoping rule as
+    /// `--depth`).
+    ///
+    /// At the default `--depth 1` the scanner never enters subdirectories,
+    /// so directory patterns like `scratch` have no effect there; raise
+    /// `--depth` (or pass `--recursive`) for directory ignoring to apply.
+    ///
+    /// Multi-volume archive sets (`.zip` + `.z01` + …, or `.7z.001` + …) are
+    /// grouped by scanning the filesystem for sibling parts *after* this
+    /// filter runs, so ignoring only *some* parts of a set (e.g.
+    /// `--ignore '*.z01'`) is unreliable — ignore the whole set instead
+    /// (e.g. `--ignore 'name.*'`).
+    #[arg(short = 'i', long, value_name = "GLOB")]
+    pub ignore: Vec<String>,
+
     /// Print the extraction plan and exit without touching the filesystem.
     #[arg(short = 'n', long, default_value_t = false)]
     pub dry_run: bool,

@@ -101,6 +101,11 @@ autoarc <DIR> --depth 3
 autoarc <DIR> --recursive
 autoarc <DIR> -r
 
+# Skip paths matching a glob during the initial scan (repeatable)
+autoarc <DIR> --ignore scratch             # skip top-level scratch/ subtree
+autoarc <DIR> -i '**/node_modules'         # skip node_modules/ at any depth
+autoarc <DIR> -i '*.tmp' -i '*.bak'        # skip top-level temp/backup files
+
 # Preview the plan without touching anything (dry-run)
 autoarc <DIR> --dry-run
 autoarc <DIR> -n
@@ -132,6 +137,35 @@ autoarc lsar ./bundle.zip
 | `--depth N` / `-d N`    | Walk up to `N` directory levels (`N ≥ 1`)                  |
 | `--depth 0`             | Unlimited recursion (alias for `--recursive`)               |
 | `--recursive` / `-r`    | Unlimited recursion                                         |
+
+#### Ignoring paths
+
+`--ignore` / `-i` takes a **glob pattern** and skips any matching path during
+the initial scan. Repeatable; a path is ignored if it matches **any** pattern.
+Patterns are matched against the path relative to `<DIR>` and are fully
+anchored (the whole relative path must match), with shell-style globbing where
+`*` stays within one path component:
+
+- `*` matches within a single path segment (never crosses `/`)
+- `**` crosses any number of directory separators
+- `{a,b}` alternation and `[abc]` character classes are supported
+
+| Pattern              | Effect                                                        |
+|----------------------|---------------------------------------------------------------|
+| `scratch`            | Skip the top-level `scratch/` folder and its entire subtree   |
+| `**/node_modules`    | Skip any `node_modules/` directory, at any depth              |
+| `*.tmp`              | Skip `*.tmp` files at the top level only                      |
+| `**/*.tmp`           | Skip `*.tmp` files at any depth                               |
+| `**/*.{tmp,bak}`     | Skip `*.tmp` or `*.bak` at any depth (one pattern)            |
+
+Matching a directory prunes its whole subtree. Only the **initial** scan is
+affected — archives produced *by* extraction are still queued recursively,
+regardless of `--ignore` (same scoping rule as `--depth`). Patterns use `/` as
+the separator; comma-separated lists are **not** split (each `--ignore` is
+exactly one pattern, so `{a,b}` alternation works). At the default
+`--depth 1` the scanner never enters subdirectories, so directory patterns
+have no effect there — raise `--depth` (or pass `-r`) for directory ignoring
+to apply.
 
 #### Plan preview & confirmation
 
@@ -253,7 +287,9 @@ layout inside each directory is the same:
 - Videos found during the scan are renamed in-place to enforce the canonical
   extension.
 - During recursive scans, directories named `*_out` are skipped to avoid
-  re-processing previous runs' artefacts.
+  re-processing previous runs' artefacts, and any path matching a `--ignore`
+  glob is pruned in the same pass (a matched directory takes its whole
+  subtree with it).
 
 ## Logging
 

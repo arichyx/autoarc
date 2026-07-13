@@ -62,17 +62,28 @@ impl TaskParams {
 /// `jobs` caps how many archives may be extracted in parallel. `0` means
 /// "auto" — fall back to [`std::thread::available_parallelism`] (else `4`).
 /// Use `1` for strictly sequential extraction.
+///
+/// `ignore_patterns` is a list of glob patterns compiled once into an
+/// [`IgnoreFilter`]. Paths matching any pattern are pruned from the
+/// **initial** scan (directories are pruned along with their entire
+/// subtree). Invalid globs surface as [`AutoarcError::Other`] before any
+/// extraction work begins.
 pub async fn run(
     dir: PathBuf,
     max_depth: usize,
     dry_run: bool,
     yes: bool,
     jobs: usize,
+    ignore_patterns: Vec<String>,
 ) -> Result<()> {
     use std::io::IsTerminal;
 
+    // Compile the --ignore globs once; invalid patterns abort before any
+    // async setup so the user gets a fast, clear error.
+    let ignore = IgnoreFilter::new(&ignore_patterns)?;
+
     // Phase 1 — scan: pure read pass, classifies every file.
-    let scan_result = scan(&dir, max_depth)?;
+    let scan_result = scan(&dir, max_depth, &ignore)?;
 
     // Phase 2 — plan: fuse multi-volume parts into single logical entries.
     let plan = build_plan(scan_result.archives);
@@ -285,6 +296,45 @@ fn resolve_jobs(cli_jobs: usize) -> usize {
 // Phase 1: scan — pure read pass that classifies files without touching them.
 // ============================================================================
 
+/// Compiled set of `--ignore` glob patterns.
+///
+/// [`IgnoreFilter::new`] with an empty slice yields an inactive filter whose
+/// [`IgnoreFilter::is_ignored`] short-circuits — so the common case of "no
+/// `--ignore`" pays nothing. Active filters use `literal_separator(true)`,
+/// meaning `*` stays within a single path component and only `**` crosses `/`.
+#[derive(Debug)]
+struct IgnoreFilter(Option<globset::GlobSet>);
+
+impl IgnoreFilter {
+    /// Compile every pattern; the first invalid one bails out with
+    /// [`AutoarcError::Other`].
+    fn new(patterns: &[String]) -> Result<Self, AutoarcError> {
+        if patterns.is_empty() {
+            return Ok(Self(None));
+        }
+        let mut builder = globset::GlobSetBuilder::new();
+        for p in patterns {
+            let glob = globset::GlobBuilder::new(p)
+                .literal_separator(true)
+                .build()
+                .map_err(|e| AutoarcError::Other(format!("invalid --ignore glob {p:?}: {e}")))?;
+            builder.add(glob);
+        }
+        let set = builder
+            .build()
+            .map_err(|e| AutoarcError::Other(format!("failed to compile --ignore set: {e}")))?;
+        Ok(Self(Some(set)))
+    }
+
+    /// True when `path` (relative to the scan root `dir`) matches any pattern.
+    fn is_ignored(&self, dir: &Path, path: &Path) -> bool {
+        match &self.0 {
+            None => false,
+            Some(set) => set.is_match(relative_path(dir, path)),
+        }
+    }
+}
+
 /// One archive file discovered during the scan.
 #[derive(Debug, Clone)]
 struct ScanItem {
@@ -307,16 +357,16 @@ struct ScanResult {
 ///
 /// This pass performs **no filesystem mutations** so it is safe to run in
 /// dry-run mode and to surface to the user for confirmation.
-fn scan(target_dir: &Path, max_depth: usize) -> Result<ScanResult> {
+fn scan(target_dir: &Path, max_depth: usize, ignore: &IgnoreFilter) -> Result<ScanResult> {
     if max_depth <= 1 {
-        scan_top_level(target_dir)
+        scan_top_level(target_dir, ignore)
     } else {
-        scan_recursive(target_dir, max_depth)
+        scan_recursive(target_dir, max_depth, ignore)
     }
 }
 
 /// Top-level scan: only the immediate contents of `target_dir`.
-fn scan_top_level(target_dir: &Path) -> Result<ScanResult> {
+fn scan_top_level(target_dir: &Path, ignore: &IgnoreFilter) -> Result<ScanResult> {
     let mut result = ScanResult {
         archives: Vec::new(),
         videos: Vec::new(),
@@ -331,6 +381,9 @@ fn scan_top_level(target_dir: &Path) -> Result<ScanResult> {
             continue;
         }
         let path = entry.path();
+        if ignore.is_ignored(target_dir, &path) {
+            continue;
+        }
         let kind = get_file_type(&path);
         if is_type_archive(kind) {
             result.archives.push(ScanItem { path, kind });
@@ -345,7 +398,11 @@ fn scan_top_level(target_dir: &Path) -> Result<ScanResult> {
 
 /// Recursive scan: walk up to `max_depth` directory levels, pruning our own
 /// `*_out` artefact directories from the walk.
-fn scan_recursive(target_dir: &Path, max_depth: usize) -> Result<ScanResult> {
+fn scan_recursive(
+    target_dir: &Path,
+    max_depth: usize,
+    ignore: &IgnoreFilter,
+) -> Result<ScanResult> {
     use walkdir::WalkDir;
 
     let mut result = ScanResult {
@@ -360,6 +417,11 @@ fn scan_recursive(target_dir: &Path, max_depth: usize) -> Result<ScanResult> {
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
+            // --ignore has first say: a matched directory prunes its whole
+            // subtree, a matched file is simply skipped.
+            if ignore.is_ignored(target_dir, e.path()) {
+                return false;
+            }
             if e.file_type().is_dir() {
                 let name = e.file_name().to_string_lossy();
                 !name.ends_with("_out")
@@ -978,5 +1040,155 @@ mod tests {
         assert_eq!(tasks[0].root, zip);
         assert_eq!(tasks[1].archive_path, sevenz);
         assert_eq!(tasks[1].root, sevenz);
+    }
+
+    // --- ignore + scan fixtures ---------------------------------------------
+
+    /// ZIP local-file-header magic, enough for `infer` to classify the file as
+    /// `application/zip` — same trick used in `src/fs/classify.rs` tests.
+    const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
+
+    /// Create a file at `dir/name` whose contents make `get_file_type` return
+    /// [`FileType::Zip`]. The scan integration tests below use this to assert
+    /// which archives survive `--ignore` pruning.
+    fn write_zip(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(ZIP_MAGIC).unwrap();
+        f.write_all(&[0u8; 64]).unwrap();
+        p
+    }
+
+    /// Sorted archive paths from a [`ScanResult`] — convenient for equality
+    /// assertions in the scan tests.
+    fn archive_paths(result: &ScanResult) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = result.archives.iter().map(|i| i.path.clone()).collect();
+        v.sort();
+        v
+    }
+
+    // --- IgnoreFilter (pure, no filesystem) ---------------------------------
+
+    #[test]
+    fn ignore_filter_empty_is_inactive() {
+        let f = IgnoreFilter::new(&[]).unwrap();
+        // An inactive filter must never claim a path, regardless of input.
+        assert!(!f.is_ignored(Path::new("/root"), Path::new("/root/scratch")));
+        assert!(!f.is_ignored(Path::new("/root"), Path::new("/root/a/b.tmp")));
+    }
+
+    #[test]
+    fn ignore_filter_bare_name_matches_top_level_only() {
+        let f = IgnoreFilter::new(&["scratch".to_string()]).unwrap();
+        let root = Path::new("/root");
+        assert!(f.is_ignored(root, Path::new("/root/scratch")));
+        // Fully anchored + literal_separator: a nested dir of the same name
+        // does NOT match a bare pattern.
+        assert!(!f.is_ignored(root, Path::new("/root/sub/scratch")));
+    }
+
+    #[test]
+    fn ignore_filter_double_star_matches_any_depth() {
+        let f = IgnoreFilter::new(&["**/node_modules".to_string()]).unwrap();
+        let root = Path::new("/root");
+        assert!(f.is_ignored(root, Path::new("/root/node_modules")));
+        assert!(f.is_ignored(root, Path::new("/root/a/node_modules")));
+        assert!(f.is_ignored(root, Path::new("/root/a/b/node_modules")));
+    }
+
+    #[test]
+    fn ignore_filter_star_does_not_cross_separator() {
+        let top = IgnoreFilter::new(&["*.tmp".to_string()]).unwrap();
+        let any = IgnoreFilter::new(&["**/*.tmp".to_string()]).unwrap();
+        let root = Path::new("/root");
+        // `*.tmp` only matches a top-level .tmp file (literal separator).
+        assert!(top.is_ignored(root, Path::new("/root/foo.tmp")));
+        assert!(!top.is_ignored(root, Path::new("/root/sub/foo.tmp")));
+        // `**/*.tmp` matches at any depth, including the top level.
+        assert!(any.is_ignored(root, Path::new("/root/foo.tmp")));
+        assert!(any.is_ignored(root, Path::new("/root/sub/foo.tmp")));
+    }
+
+    #[test]
+    fn ignore_filter_multiple_patterns_match_on_any() {
+        let f = IgnoreFilter::new(&["scratch".to_string(), "*.tmp".to_string()]).unwrap();
+        let root = Path::new("/root");
+        assert!(f.is_ignored(root, Path::new("/root/scratch")));
+        assert!(f.is_ignored(root, Path::new("/root/foo.tmp")));
+        assert!(!f.is_ignored(root, Path::new("/root/keep.zip")));
+    }
+
+    #[test]
+    fn ignore_filter_invalid_glob_errors() {
+        // An unclosed character class is not a valid glob.
+        let err = IgnoreFilter::new(&["[unclosed".to_string()]).unwrap_err();
+        assert!(matches!(err, AutoarcError::Other(_)), "got {err:?}");
+    }
+
+    // --- scan integration (TempDir + ZIP magic) -----------------------------
+
+    #[test]
+    fn scan_recursive_prunes_ignored_directory_subtree() {
+        let td = TempDir::new().unwrap();
+        let keep = write_zip(td.path(), "keep.zip");
+        std::fs::create_dir(td.path().join("scratch")).unwrap();
+        write_zip(&td.path().join("scratch"), "inner.zip");
+
+        let ignore = IgnoreFilter::new(&["scratch".to_string()]).unwrap();
+        let result = scan(td.path(), 5, &ignore).unwrap();
+        assert_eq!(archive_paths(&result), vec![keep]);
+    }
+
+    #[test]
+    fn scan_recursive_double_star_prunes_nested_dir() {
+        let td = TempDir::new().unwrap();
+        std::fs::create_dir_all(td.path().join("a/b/node_modules")).unwrap();
+        write_zip(&td.path().join("a/b/node_modules"), "x.zip");
+        let keep = write_zip(&td.path().join("a"), "keep.zip");
+
+        let ignore = IgnoreFilter::new(&["**/node_modules".to_string()]).unwrap();
+        let result = scan(td.path(), 10, &ignore).unwrap();
+        assert_eq!(archive_paths(&result), vec![keep]);
+    }
+
+    #[test]
+    fn scan_top_level_ignores_matching_file() {
+        let td = TempDir::new().unwrap();
+        let keep = write_zip(td.path(), "keep.zip");
+        write_zip(td.path(), "secret.zip");
+
+        let ignore = IgnoreFilter::new(&["secret.zip".to_string()]).unwrap();
+        let result = scan(td.path(), 1, &ignore).unwrap();
+        assert_eq!(archive_paths(&result), vec![keep]);
+    }
+
+    #[test]
+    fn scan_top_level_with_empty_ignore_returns_all() {
+        let td = TempDir::new().unwrap();
+        let a = write_zip(td.path(), "a.zip");
+        let b = write_zip(td.path(), "b.zip");
+
+        let ignore = IgnoreFilter::new(&[]).unwrap();
+        let result = scan(td.path(), 1, &ignore).unwrap();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(archive_paths(&result), expected);
+    }
+
+    #[test]
+    fn scan_recursive_out_pruning_coexists_with_ignore() {
+        let td = TempDir::new().unwrap();
+        let foo = write_zip(td.path(), "foo.zip");
+        // A fake prior-run artefact dir: pruned by the `_out` rule even
+        // without any --ignore pattern.
+        std::fs::create_dir(td.path().join("foo_zip_out")).unwrap();
+        write_zip(&td.path().join("foo_zip_out"), "already.zip");
+        // An unrelated dir that --ignore prunes.
+        std::fs::create_dir(td.path().join("scratch")).unwrap();
+        write_zip(&td.path().join("scratch"), "inner.zip");
+
+        let ignore = IgnoreFilter::new(&["scratch".to_string()]).unwrap();
+        let result = scan(td.path(), 5, &ignore).unwrap();
+        assert_eq!(archive_paths(&result), vec![foo]);
     }
 }

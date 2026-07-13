@@ -38,7 +38,15 @@ async fn main() -> Result<()> {
             // CLI input and falling back to `AUTOARC_PASSWORDS`. Must happen
             // before any extractor task reads it via `get_password_list()`.
             config::init_password_list(args.passwords);
-            autoarc::runner::run(args.dir, max_depth, args.dry_run, args.yes, args.jobs).await?
+            autoarc::runner::run(
+                args.dir,
+                max_depth,
+                args.dry_run,
+                args.yes,
+                args.jobs,
+                args.ignore,
+            )
+            .await?
         }
     }
 
