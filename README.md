@@ -39,7 +39,7 @@ cargo install autoarc
 From source:
 
 ```bash
-git clone https://github.com/Arichy/autoarc.git
+git clone https://github.com/arichyx/autoarc.git
 cd autoarc
 cargo install --path .
 ```
