@@ -100,9 +100,11 @@ impl Reporter {
             s.failed += 1;
         }
         self.overall.inc(1);
-        let _ = self
-            .multi
-            .println(format!("{} {}: {}", style("FAIL").red().bold(), label, err));
+        let line = format!("{} {}: {}", style("FAIL").red().bold(), label, err);
+        // `MultiProgress::println` is hidden when stderr is not a terminal.
+        // Suspending and writing directly preserves diagnostics in CI/pipes
+        // while still keeping interactive progress bars intact.
+        self.multi.suspend(|| eprintln!("{line}"));
     }
 
     /// Increment the renamed-video counter (used by extractors).
@@ -118,7 +120,7 @@ impl Reporter {
     }
 
     /// Stop the bars and print a coloured summary table.
-    pub fn finish_summary(self) {
+    pub fn finish_summary(self) -> usize {
         self.overall.finish_and_clear();
         let stats = self
             .stats
@@ -132,7 +134,7 @@ impl Reporter {
         let fail = Style::new().red().bold();
         let neutral = Style::new().cyan();
 
-        let _ = self.multi.println(format!(
+        let summary = format!(
             "\n{}\n  {} {}\n  {} {}\n  {} {}\n  {} {:.2?}\n",
             label.apply_to("Summary"),
             ok.apply_to("succeeded :"),
@@ -143,7 +145,9 @@ impl Reporter {
             stats.videos_renamed,
             label.apply_to("elapsed   :"),
             elapsed,
-        ));
+        );
+        self.multi.suspend(|| eprintln!("{summary}"));
+        stats.failed
     }
 }
 
@@ -221,13 +225,14 @@ impl TaskReporter {
     /// `Task  ERR <label>: <err>` line above the remaining live bars.
     pub fn finish_err(self, err: &dyn std::fmt::Display) {
         self.bar.finish_and_clear();
-        let _ = self.multi.println(format!(
+        let line = format!(
             "{:>10} {} {}: {}",
             style("Task").yellow(),
             style("ERR").red().bold(),
             self.label,
             err,
-        ));
+        );
+        self.multi.suspend(|| eprintln!("{line}"));
     }
 }
 

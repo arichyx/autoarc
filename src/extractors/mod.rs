@@ -20,12 +20,17 @@ pub mod unar;
 pub mod zip;
 
 /// Outcome of attempting to extract an archive with one specific password.
+#[derive(Debug)]
 pub enum ExtractOutcome {
     /// Extraction succeeded; the inner vector lists any nested archives that
     /// the runner should now enqueue.
     Success(Vec<PathBuf>),
     /// The password was incorrect; the central driver will try the next one.
     BadPassword,
+    /// The backend could not distinguish a wrong password from another
+    /// recoverable attempt failure. Keep trying, but preserve this diagnostic
+    /// in case no candidate succeeds.
+    RetryableFailure(String),
 }
 
 /// One archive backend (zip, rar, 7z, or `unar` subprocess).
@@ -44,11 +49,16 @@ fn try_with_passwords<E: Extractor>(
     passwords: &[String],
     reporter: &TaskReporter,
 ) -> Result<Vec<PathBuf>> {
+    let mut deferred_failure = None;
     for password in passwords {
         match E::try_extract(path, password, reporter)? {
             ExtractOutcome::Success(children) => return Ok(children),
             ExtractOutcome::BadPassword => continue,
+            ExtractOutcome::RetryableFailure(message) => deferred_failure = Some(message),
         }
+    }
+    if let Some(message) = deferred_failure {
+        return Err(AutoarcError::Other(message).into());
     }
     Err(AutoarcError::NoCorrectPassword.into())
 }
@@ -79,4 +89,73 @@ pub fn run(
             root: root.clone(),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExtractOutcome, Extractor, try_with_passwords};
+    use crate::AutoarcError;
+    use crate::progress::{Reporter, TaskReporter};
+    use std::path::{Path, PathBuf};
+
+    struct AmbiguousThenSuccess;
+
+    impl Extractor for AmbiguousThenSuccess {
+        fn try_extract(
+            _path: &Path,
+            password: &str,
+            _reporter: &TaskReporter,
+        ) -> anyhow::Result<ExtractOutcome> {
+            if password == "correct" {
+                Ok(ExtractOutcome::Success(vec![PathBuf::from("child.zip")]))
+            } else {
+                Ok(ExtractOutcome::RetryableFailure(
+                    "backend diagnostic".to_string(),
+                ))
+            }
+        }
+    }
+
+    struct AlwaysAmbiguous;
+
+    impl Extractor for AlwaysAmbiguous {
+        fn try_extract(
+            _path: &Path,
+            _password: &str,
+            _reporter: &TaskReporter,
+        ) -> anyhow::Result<ExtractOutcome> {
+            Ok(ExtractOutcome::RetryableFailure(
+                "backend diagnostic".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn retryable_failure_does_not_stop_later_passwords() {
+        let reporter = Reporter::new(1).task("password loop");
+        let passwords = vec!["".to_string(), "correct".to_string()];
+
+        let children =
+            try_with_passwords::<AmbiguousThenSuccess>(Path::new("archive"), &passwords, &reporter)
+                .unwrap();
+
+        assert_eq!(children, [PathBuf::from("child.zip")]);
+    }
+
+    #[test]
+    fn retryable_failure_preserves_backend_diagnostic_after_exhaustion() {
+        let reporter = Reporter::new(1).task("password loop");
+        let passwords = vec!["".to_string(), "wrong".to_string()];
+
+        let error =
+            try_with_passwords::<AlwaysAmbiguous>(Path::new("archive"), &passwords, &reporter)
+                .unwrap_err();
+
+        assert!(
+            error.downcast_ref::<AutoarcError>().is_some_and(
+                |error| matches!(error, AutoarcError::Other(message) if message == "backend diagnostic")
+            ),
+            "unexpected error: {error:#}",
+        );
+    }
 }

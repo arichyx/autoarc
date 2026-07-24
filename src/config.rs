@@ -51,18 +51,18 @@ fn resolve(cli: Option<Vec<String>>) -> Vec<String> {
     with_empty_prefix(source)
 }
 
-/// Parse `AUTOARC_PASSWORDS` into a cleaned list (no empty entries).
+/// Parse `AUTOARC_PASSWORDS` into an exact list (apart from empty separators).
 fn parse_env() -> Vec<String> {
     let raw = std::env::var("AUTOARC_PASSWORDS").unwrap_or_default();
     sanitize(raw.split(',').map(|s| s.to_string()).collect())
 }
 
-/// Trim whitespace and drop empty entries from an arbitrary password list.
+/// Preserve password bytes exactly while dropping empty separators.
+///
+/// Leading and trailing whitespace can be part of a real archive password and
+/// must not be normalised.
 fn sanitize(list: Vec<String>) -> Vec<String> {
-    list.into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    list.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
 /// Ensure the empty password is present at position 0 so unencrypted archives
@@ -85,14 +85,21 @@ mod tests {
     // --- sanitize ------------------------------------------------------------
 
     #[test]
-    fn sanitize_trims_and_drops_empties() {
+    fn sanitize_preserves_whitespace_and_drops_only_empty_values() {
         let got = sanitize(vec![
             "  alpha  ".into(),
             "".into(),
             " beta".into(),
             "   ".into(),
         ]);
-        assert_eq!(got, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            got,
+            vec![
+                "  alpha  ".to_string(),
+                " beta".to_string(),
+                "   ".to_string()
+            ]
+        );
     }
 
     // --- with_empty_prefix ---------------------------------------------------
@@ -123,23 +130,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_with_cli_passwords_trims_whitespace_and_drops_empties() {
+    fn resolve_with_cli_passwords_preserves_whitespace_and_drops_empties() {
         let got = resolve(Some(vec!["  alpha  ".into(), "".into(), " beta".into()]));
         assert_eq!(
             got,
-            vec![String::new(), "alpha".to_string(), "beta".to_string()]
+            vec![String::new(), "  alpha  ".to_string(), " beta".to_string()]
         );
     }
 
     #[test]
-    fn resolve_with_cli_all_whitespace_falls_through_to_env_branch() {
-        // If every CLI entry sanitizes to empty, we currently *still* go to
-        // the CLI branch (because `!list.is_empty()` is true before
-        // sanitize). We'd then end up with just the empty-prefix password.
-        // Document that behaviour here so future changes don't silently
-        // flip it.
+    fn resolve_with_cli_whitespace_passwords_keeps_them_exactly() {
         let got = resolve(Some(vec!["   ".into(), "\t".into()]));
-        assert_eq!(got, vec![String::new()]);
+        assert_eq!(
+            got,
+            vec![String::new(), "   ".to_string(), "\t".to_string()]
+        );
     }
 
     #[test]

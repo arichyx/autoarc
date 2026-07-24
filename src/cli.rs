@@ -114,6 +114,8 @@ pub struct Args {
     /// `AUTOARC_PASSWORDS` environment variable (same comma-separated
     /// format); when neither is set, only the empty password is tried.
     /// The empty password is always tried first regardless of source.
+    /// Password values are otherwise preserved exactly, including leading or
+    /// trailing whitespace.
     ///
     /// Security note: passwords on the command line may be visible to
     /// other processes via `ps(1)` and to your shell history. Prefer
@@ -138,4 +140,18 @@ pub enum Commands {
 
     /// Run `lsar` against a single archive and print its entry list.
     Lsar { filepath: PathBuf },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn password_arguments_preserve_surrounding_whitespace() {
+        let args = Args::try_parse_from(["autoarc", "--password", " leading ,trailing ", "--yes"])
+            .unwrap();
+
+        assert_eq!(args.passwords, [" leading ", "trailing "]);
+    }
 }

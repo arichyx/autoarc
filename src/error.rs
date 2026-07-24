@@ -26,6 +26,14 @@ pub enum AutoarcError {
         source: std::io::Error,
     },
 
+    /// An archive entry attempted to escape its dedicated output directory.
+    #[error("Unsafe entry path {entry:?} in archive {archive}")]
+    UnsafeArchivePath { archive: PathBuf, entry: PathBuf },
+
+    /// A write or rename would replace an existing filesystem object.
+    #[error("Refusing to overwrite existing output: {0}")]
+    OutputCollision(PathBuf),
+
     /// Catch-all for situations that don't fit the above variants.
     #[error("{0}")]
     Other(String),

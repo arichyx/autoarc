@@ -58,6 +58,9 @@ cargo install --path .
 3. The empty password only — which is also always tried first, regardless
    of source, so unencrypted archives extract cleanly without any setup.
 
+Password values are preserved exactly, including leading and trailing
+whitespace; only empty comma-separated fields are ignored.
+
 For long-lived secrets, the most convenient source is a `.env` file at the
 project root; see [`.env.example`](.env.example):
 
@@ -197,9 +200,8 @@ scanned. When `depth > 1` (or `--recursive`), autoarc descends into
 subdirectories while pruning its own `_out/` output folders from the walk to
 avoid re-processing previous runs. In either mode, archives are extracted
 **in place** — each archive gets a sibling directory whose name is the full
-filename with every `.` replaced by `_` plus the `_out` suffix (so `foo.zip`
-→ `foo_zip_out/`, `foo.7z` → `foo_7z_out/`), and the original archive is
-never moved.
+filename plus the `_out` suffix (so `foo.zip` → `foo.zip_out/`, `foo.7z` →
+`foo.7z_out/`), and the original archive is never moved.
 
 ### `just` recipes
 
@@ -233,10 +235,10 @@ just check         # one-shot: fmt-check + lint + release build
 - Multi-password trial-and-error per archive (stops on first match)
 - Live `indicatif` progress bars + a coloured run summary
 - Archives are extracted **in place** next to the originals — each archive
-  gets a sibling `_out/` directory named after the full filename with every
-  `.` replaced by `_` (so `foo.zip` → `foo_zip_out/`, `foo.7z` →
-  `foo_7z_out/`); sibling archives sharing a stem never collide. Originals
-  are never moved.
+  gets a sibling `_out/` directory by appending the suffix to the complete
+  filename (so `foo.zip` → `foo.zip_out/`, `foo.7z` → `foo.7z_out/`).
+  Names that differ only by dots versus underscores remain distinct, and
+  originals are never moved.
 - Detected videos (`.mp4`, `.ts`) inside archives get their extension corrected
   in-place; audio / PDF / Office / text files are counted and reported but
   never modified
@@ -258,13 +260,13 @@ Given `autoarc /tmp/in` (default `--depth 1`):
 ```
 /tmp/in/
 ├── foo.zip              # original, untouched
-├── foo_zip_out/...      # extracted contents, sibling of the archive
+├── foo.zip_out/...      # extracted contents, sibling of the archive
 ├── bar.rar
-└── bar_rar_out/...
+└── bar.rar_out/...
 ```
 
 If `foo.zip` and `foo.7z` both live in the same directory, they get
-`foo_zip_out/` and `foo_7z_out/` respectively — no collision.
+`foo.zip_out/` and `foo.7z_out/` respectively — no collision.
 
 With `--depth N > 1` or `--recursive`, subdirectories are walked too; the
 layout inside each directory is the same:
@@ -272,14 +274,16 @@ layout inside each directory is the same:
 ```
 /tmp/in/
 ├── sub/foo.zip
-├── sub/foo_zip_out/...
+├── sub/foo.zip_out/...
 └── sub/nested/bar.rar
-    └── bar_rar_out/...
+    └── bar.rar_out/...
 ```
 
 - Archives are always extracted **in place** — autoarc never moves or
   backs up your originals. If you want a safety copy, make it yourself
   before running.
+- Existing destination files or output directories are never replaced. A
+  collision fails that archive task and leaves the existing data untouched.
 - The depth limit only applies to the **initial** scan. Archives produced *by
   extraction itself* are always queued recursively, regardless of `--depth`.
 - Multi-volume archives are handled as a single logical unit and extracted in
@@ -290,6 +294,8 @@ layout inside each directory is the same:
   re-processing previous runs' artefacts, and any path matching a `--ignore`
   glob is pruned in the same pass (a matched directory takes its whole
   subtree with it).
+- If any archive task fails, the diagnostic and summary are printed even when
+  stderr is redirected, and the process exits with a non-zero status.
 
 ## Logging
 

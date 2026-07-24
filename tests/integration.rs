@@ -67,7 +67,7 @@ fn zip_no_password_extracts_plaintext() {
         "unencrypted zip should succeed with no children",
     );
 
-    let out = td.path().join("single_nopass_zip_out/hello.txt");
+    let out = td.path().join("single_nopass.zip_out/hello.txt");
     assert_eq!(fs::read_to_string(out).unwrap(), HELLO_TXT);
 }
 
@@ -100,7 +100,7 @@ fn zip_with_password_extracts_with_correct_password() {
     let outcome = ZipExtractor::try_extract(&archive, "secret", &reporter()).unwrap();
     assert!(matches!(outcome, ExtractOutcome::Success(_)));
 
-    let out = td.path().join("single_pass_zip_out/hello.txt");
+    let out = td.path().join("single_pass.zip_out/hello.txt");
     assert_eq!(fs::read_to_string(out).unwrap(), HELLO_TXT);
 }
 
@@ -119,6 +119,9 @@ fn nested_zip_surfaces_inner_7z_as_child() {
     let children = match outcome {
         ExtractOutcome::Success(c) => c,
         ExtractOutcome::BadPassword => panic!("outer zip rejected 'outer' password"),
+        ExtractOutcome::RetryableFailure(message) => {
+            panic!("outer zip failed ambiguously: {message}")
+        }
     };
     assert_eq!(
         children.len(),
@@ -130,11 +133,11 @@ fn nested_zip_surfaces_inner_7z_as_child() {
     assert!(inner_7z.exists(), "inner.7z must be materialised on disk");
 
     // Step 2: extract the inner 7z with its own password. The plaintext should
-    // end up at {tempdir}/nested_pass_zip_out/inner_7z_out/hello.txt.
+    // end up at {tempdir}/nested_pass.zip_out/inner.7z_out/hello.txt.
     let outcome = SevenzExtractor::try_extract(inner_7z, "inner", &reporter()).unwrap();
     assert!(matches!(outcome, ExtractOutcome::Success(_)));
 
-    let out = inner_7z.parent().unwrap().join("inner_7z_out/hello.txt");
+    let out = inner_7z.parent().unwrap().join("inner.7z_out/hello.txt");
     assert_eq!(fs::read_to_string(out).unwrap(), HELLO_TXT);
 }
 
@@ -185,14 +188,57 @@ fn multi_volume_7z_extracts_via_unar() {
         "unar must accept the multi-volume 7z and report Success",
     );
 
-    // The out dir for `split.7z.001` is `split_7z_001_out/` (every `.` in the
-    // file name becomes `_`), so sibling archives sharing the `split` stem
-    // never collide.
-    let out = td.path().join("split_7z_001_out/bigfile.bin");
+    // The complete archive name is retained, so names that differ only by
+    // dots versus underscores cannot collapse onto the same output path.
+    let out = td.path().join("split.7z.001_out/bigfile.bin");
     let data = fs::read(&out).unwrap_or_else(|e| panic!("read {}: {e}", out.display()));
     assert_eq!(
         data.len(),
         4096,
         "extracted payload must match the 4096-byte fixture source",
     );
+}
+
+#[test]
+fn unar_never_deletes_a_preexisting_output_directory() {
+    let td = tempdir();
+    let primary = copy_fixture(&td, "split.7z.001");
+    let outdir = td.path().join("split.7z.001_out");
+    fs::create_dir(&outdir).unwrap();
+    let note = outdir.join("user-note.txt");
+    fs::write(&note, b"keep me").unwrap();
+
+    let err = UnarExtractor::try_extract(&primary, "", &reporter()).unwrap_err();
+
+    assert!(
+        err.downcast_ref::<autoarc::AutoarcError>().is_some_and(
+            |e| matches!(e, autoarc::AutoarcError::OutputCollision(path) if path == &outdir)
+        ),
+        "expected an output-collision error, got {err:#}",
+    );
+    assert_eq!(fs::read(note).unwrap(), b"keep me");
+}
+
+#[test]
+fn failed_unar_attempt_cleans_only_its_private_staging_directory() {
+    let td = tempdir();
+    let primary = copy_fixture(&td, "split.7z.001");
+
+    let outcome = UnarExtractor::try_extract(&primary, "", &reporter()).unwrap();
+
+    assert!(
+        matches!(outcome, ExtractOutcome::RetryableFailure(_)),
+        "missing split volumes must remain retryable for later passwords",
+    );
+    assert!(!td.path().join("split.7z.001_out").exists());
+    let leaked_staging = fs::read_dir(td.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".autoarc-unar-")
+        });
+    assert!(!leaked_staging, "failed attempt leaked a staging directory");
 }

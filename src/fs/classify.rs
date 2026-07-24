@@ -62,7 +62,9 @@ pub fn get_file_type(path: &Path) -> FileType {
                 let is_multi = path
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext == "z01" || ext == "001");
+                    .is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("z01") || ext.eq_ignore_ascii_case("001")
+                    });
                 if is_multi {
                     FileType::Multi
                 } else {
@@ -77,7 +79,7 @@ pub fn get_file_type(path: &Path) -> FileType {
                 let is_multi = path
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext == "001");
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("001"));
                 if is_multi {
                     FileType::Multi
                 } else {
@@ -299,6 +301,13 @@ mod tests {
     fn zip_with_z01_extension_is_multi() {
         let dir = TempDir::new().unwrap();
         let p = write_file(&dir, "foo.z01", ZIP_MAGIC);
+        assert_eq!(get_file_type(&p), FileType::Multi);
+    }
+
+    #[test]
+    fn zip_with_uppercase_z01_extension_is_multi() {
+        let dir = TempDir::new().unwrap();
+        let p = write_file(&dir, "foo.Z01", ZIP_MAGIC);
         assert_eq!(get_file_type(&p), FileType::Multi);
     }
 

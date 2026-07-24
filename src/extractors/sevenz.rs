@@ -1,6 +1,6 @@
 //! 7-Zip backend powered by [`sevenz_rust2`].
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -91,7 +91,7 @@ fn check_password(archive_path: &Path, password_str: &str) -> Result<bool, Seven
     }
 }
 
-/// Stream every entry to `<archive_dir>/<stem>_out/...` once `password` is verified.
+/// Stream every entry to `<archive_dir>/<filename>_out/...` once `password` is verified.
 fn sevenz_with_password(
     archive_path: &Path,
     password: &str,
@@ -112,14 +112,18 @@ fn sevenz_with_password(
         }
         if entry.has_stream() {
             let filename = entry.name();
-            let outpath = create_outpath(&archive_path_owned, Path::new(filename));
+            let outpath = create_outpath(&archive_path_owned, Path::new(filename))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             if let Some(parent) = outpath.parent()
                 && !parent.exists()
             {
                 fs::create_dir_all(parent)?;
             }
 
-            let mut output = File::create(&outpath)?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&outpath)?;
             std::io::copy(file_reader, &mut output)?;
 
             reporter.set_message(filename.to_string());

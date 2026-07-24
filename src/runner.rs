@@ -16,7 +16,7 @@ use crate::error::AutoarcError;
 use crate::extractors;
 use crate::fs::{
     FileType, get_file_type, is_type_archive, is_type_document, is_type_video, relative_path,
-    rename_video,
+    rename_video, video_rename_target,
 };
 use crate::progress::Reporter;
 
@@ -114,8 +114,8 @@ pub async fn run(
     // Phase 4 — execute: rename videos and emit one TaskParams per plan item.
     //
     // Archives are always extracted in place: each extractor writes into a
-    // sibling `{filename_with_dots_replaced}_out/` directory (e.g. `foo.zip`
-    // → `foo_zip_out/`, `foo.7z` → `foo_7z_out/`). We don't move or back up
+    // sibling `{complete_filename}_out/` directory (e.g. `foo.zip`
+    // → `foo.zip_out/`, `foo.7z` → `foo.7z_out/`). We don't move or back up
     // the originals — that's the user's call.
     let initial_tasks = execute(plan, scan_result.videos)?;
     debug!("initial tasks: {initial_tasks:?}");
@@ -191,11 +191,15 @@ pub async fn run(
     info!("all tasks finished; signalling shutdown");
     shutdown.notify_waiters();
 
-    if let Err(e) = consumer_handle.await {
-        tracing::error!("consumer join failed: {e}");
-    }
+    let consumer_error = consumer_handle.await.err();
+    let failed = reporter.finish_summary();
 
-    reporter.finish_summary();
+    if let Some(error) = consumer_error {
+        return Err(AutoarcError::Other(format!("consumer task failed: {error}")).into());
+    }
+    if failed > 0 {
+        return Err(AutoarcError::Other(format!("{failed} archive task(s) failed")).into());
+    }
     Ok(())
 }
 
@@ -531,6 +535,7 @@ fn discover_volume_parts(primary: &Path) -> Option<Vec<PathBuf>> {
     let parent = primary.parent()?;
     let name = primary.file_name()?.to_str()?;
     let lower = name.to_ascii_lowercase();
+    let siblings = sibling_paths_by_lowercase_name(parent)?;
 
     // ZIP-style multi-volume: foo.zip + foo.z01 + foo.z02 + ... + foo.zNN.
     let zip_stem_len = lower
@@ -540,14 +545,14 @@ fn discover_volume_parts(primary: &Path) -> Option<Vec<PathBuf>> {
     if let Some(stem_len) = zip_stem_len {
         let stem_orig = &name[..stem_len];
         let mut parts = Vec::new();
-        let zip_path = parent.join(format!("{stem_orig}.zip"));
-        if zip_path.exists() {
-            parts.push(zip_path);
+        let zip_name = format!("{stem_orig}.zip").to_ascii_lowercase();
+        if let Some(zip_path) = siblings.get(&zip_name) {
+            parts.push(zip_path.clone());
         }
         for n in 1..=99 {
-            let z = parent.join(format!("{stem_orig}.z{n:02}"));
-            if z.exists() {
-                parts.push(z);
+            let z_name = format!("{stem_orig}.z{n:02}").to_ascii_lowercase();
+            if let Some(z) = siblings.get(&z_name) {
+                parts.push(z.clone());
             } else if n > 1 {
                 break;
             }
@@ -562,9 +567,9 @@ fn discover_volume_parts(primary: &Path) -> Option<Vec<PathBuf>> {
         let stem_orig = &name[..stem_len];
         let mut parts = Vec::new();
         for n in 1..=999 {
-            let p = parent.join(format!("{stem_orig}.{n:03}"));
-            if p.exists() {
-                parts.push(p);
+            let part_name = format!("{stem_orig}.{n:03}").to_ascii_lowercase();
+            if let Some(p) = siblings.get(&part_name) {
+                parts.push(p.clone());
             } else if n > 1 {
                 break;
             }
@@ -575,6 +580,33 @@ fn discover_volume_parts(primary: &Path) -> Option<Vec<PathBuf>> {
     }
 
     None
+}
+
+/// Enumerate sibling files once and retain their actual on-disk casing.
+fn sibling_paths_by_lowercase_name(
+    parent: &Path,
+) -> Option<std::collections::HashMap<String, PathBuf>> {
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let mut siblings = std::collections::HashMap::new();
+    for entry in std::fs::read_dir(parent).ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let filename = entry.file_name();
+        let Some(name) = filename.to_str() else {
+            continue;
+        };
+        let name = name.to_ascii_lowercase();
+        siblings.entry(name).or_insert_with(|| entry.path());
+    }
+    Some(siblings)
 }
 
 /// Case-insensitive extension check.
@@ -723,7 +755,7 @@ fn prompt_continue() -> Result<bool> {
 /// [`TaskParams`] per logical archive for the runner to consume.
 ///
 /// Archives are **not** moved — each extractor writes into a sibling
-/// `{filename_with_dots_replaced}_out/` directory (`foo.zip` → `foo_zip_out/`),
+/// `{complete_filename}_out/` directory (`foo.zip` → `foo.zip_out/`),
 /// keeping originals exactly where the user put them.
 fn execute(plan: Vec<PlanItem>, videos: Vec<(PathBuf, FileType)>) -> Result<Vec<TaskParams>> {
     let tasks = plan
@@ -733,6 +765,22 @@ fn execute(plan: Vec<PlanItem>, videos: Vec<(PathBuf, FileType)>) -> Result<Vec<
             root: item.primary,
         })
         .collect();
+
+    // Validate the entire rename set before mutating anything so a conflict
+    // cannot leave half the top-level videos renamed.
+    let mut rename_targets = std::collections::HashMap::new();
+    for (path, kind) in &videos {
+        let Some(target) = video_rename_target(path, *kind) else {
+            continue;
+        };
+        if target.exists()
+            || rename_targets
+                .insert(target.clone(), path.clone())
+                .is_some()
+        {
+            return Err(AutoarcError::OutputCollision(target).into());
+        }
+    }
 
     for (path, kind) in videos {
         rename_video(&path, kind)?;
@@ -816,12 +864,12 @@ mod tests {
     #[test]
     fn display_shows_nested_arrow_when_descending_from_parent() {
         let task = TaskParams {
-            archive_path: PathBuf::from("/work/foo_zip_out/inner.7z"),
+            archive_path: PathBuf::from("/work/foo.zip_out/inner.7z"),
             root: PathBuf::from("/work/foo.zip"),
         };
         assert_eq!(
             task.display(Path::new("/work")),
-            "foo_zip_out/inner.7z <- foo.zip"
+            "foo.zip_out/inner.7z <- foo.zip"
         );
     }
 
@@ -894,28 +942,28 @@ mod tests {
     #[test]
     fn discover_handles_case_insensitive_extensions() {
         let td = TempDir::new().unwrap();
-        // Upper-case .ZIP alongside lower-case .z01 is common on mixed systems.
-        // We only assert on the part count + filenames (case-insensitive) because
-        // the paths rebuilt by `discover_volume_parts` use the anchor's casing
-        // for the stem, which may differ textually from what `touch` returned
-        // even though they resolve to the same file on APFS/HFS+.
-        touch(td.path(), "MIX.ZIP");
-        touch(td.path(), "MIX.z01");
+        // Retain actual paths so this works on case-sensitive filesystems too.
+        let zip = touch(td.path(), "MIX.ZIP");
+        let z01 = touch(td.path(), "MIX.Z01");
 
         let entry = td.path().join("MIX.ZIP");
         let parts = discover_volume_parts(&entry).expect("should handle upper-case .ZIP");
-        assert_eq!(parts.len(), 2);
-        let names: Vec<String> = parts
-            .iter()
-            .map(|p| {
-                p.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-            })
-            .collect();
-        assert!(names.contains(&"mix.zip".to_string()));
-        assert!(names.contains(&"mix.z01".to_string()));
+        assert_eq!(parts, vec![zip, z01]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_non_utf8_sibling_does_not_disable_volume_discovery() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let td = TempDir::new().unwrap();
+        let zip = touch(td.path(), "multi.zip");
+        let z01 = touch(td.path(), "multi.z01");
+        let odd_name = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        std::fs::File::create(td.path().join(odd_name)).unwrap();
+
+        let parts = discover_volume_parts(&zip).expect("should ignore unrelated non-UTF8 names");
+        assert_eq!(parts, vec![zip, z01]);
     }
 
     // --- build_plan ----------------------------------------------------------
@@ -1040,6 +1088,36 @@ mod tests {
         assert_eq!(tasks[0].root, zip);
         assert_eq!(tasks[1].archive_path, sevenz);
         assert_eq!(tasks[1].root, sevenz);
+    }
+
+    #[test]
+    fn execute_rejects_video_target_collision_before_any_rename() {
+        let td = TempDir::new().unwrap();
+        let first = td.path().join("first.bin");
+        let second = td.path().join("second.bin");
+        let first_target = td.path().join("first.mp4");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        std::fs::write(&first_target, b"existing").unwrap();
+
+        let err = execute(
+            Vec::new(),
+            vec![
+                (second.clone(), FileType::Mp4),
+                (first.clone(), FileType::Mp4),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<AutoarcError>().is_some_and(
+                |e| matches!(e, AutoarcError::OutputCollision(path) if path == &first_target)
+            ),
+            "expected output collision, got {err:#}",
+        );
+        assert!(first.exists());
+        assert!(second.exists());
+        assert_eq!(std::fs::read(first_target).unwrap(), b"existing");
     }
 
     // --- ignore + scan fixtures ---------------------------------------------
@@ -1181,8 +1259,8 @@ mod tests {
         let foo = write_zip(td.path(), "foo.zip");
         // A fake prior-run artefact dir: pruned by the `_out` rule even
         // without any --ignore pattern.
-        std::fs::create_dir(td.path().join("foo_zip_out")).unwrap();
-        write_zip(&td.path().join("foo_zip_out"), "already.zip");
+        std::fs::create_dir(td.path().join("foo.zip_out")).unwrap();
+        write_zip(&td.path().join("foo.zip_out"), "already.zip");
         // An unrelated dir that --ignore prunes.
         std::fs::create_dir(td.path().join("scratch")).unwrap();
         write_zip(&td.path().join("scratch"), "inner.zip");
@@ -1190,5 +1268,20 @@ mod tests {
         let ignore = IgnoreFilter::new(&["scratch".to_string()]).unwrap();
         let result = scan(td.path(), 5, &ignore).unwrap();
         assert_eq!(archive_paths(&result), vec![foo]);
+    }
+
+    #[tokio::test]
+    async fn run_returns_an_error_when_an_archive_task_fails() {
+        let td = TempDir::new().unwrap();
+        write_zip(td.path(), "broken.zip");
+
+        let err = run(td.path().to_path_buf(), 1, false, true, 1, Vec::new())
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("archive task(s) failed"),
+            "unexpected runner error: {err:#}",
+        );
     }
 }
