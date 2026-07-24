@@ -19,6 +19,8 @@ pub enum FileType {
     SevenZ,
     /// MP4 / M4V video container.
     Mp4,
+    /// Apple QuickTime / MOV video container.
+    Mov,
     /// MPEG transport-stream video.
     TS,
     /// Archive that must be handled by the `unar` subprocess backend:
@@ -88,6 +90,7 @@ pub fn get_file_type(path: &Path) -> FileType {
             }
             // --- videos -------------------------------------------------
             "video/mp4" | "video/x-m4v" => FileType::Mp4,
+            "video/quicktime" => FileType::Mov,
             // --- audio --------------------------------------------------
             "audio/mpeg" | "audio/aac" | "audio/x-flac" | "audio/flac" | "audio/ogg"
             | "audio/wav" | "audio/x-wav" | "audio/x-aiff" | "audio/m4a" | "audio/midi"
@@ -187,7 +190,7 @@ pub fn is_type_archive(t: FileType) -> bool {
 
 /// Returns `true` for the video formats the pipeline can post-process.
 pub fn is_type_video(t: FileType) -> bool {
-    matches!(t, FileType::Mp4 | FileType::TS)
+    matches!(t, FileType::Mp4 | FileType::Mov | FileType::TS)
 }
 
 /// Returns `true` for the non-archive, non-video media formats the scanner
@@ -215,6 +218,7 @@ mod tests {
     const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
     const SEVENZ_MAGIC: &[u8] = &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
     const RAR4_MAGIC: &[u8] = b"Rar!\x1A\x07\x00";
+    const QUICKTIME_MAGIC: &[u8] = b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  ";
     // Just enough of a PE header for `infer` to classify the file as
     // application/vnd.microsoft.portable-executable.
     const PE_STUB: &[u8] = b"MZ\x90\x00";
@@ -249,6 +253,7 @@ mod tests {
         assert!(is_type_archive(FileType::Multi));
         assert!(is_type_archive(FileType::Sfx));
         assert!(!is_type_archive(FileType::Mp4));
+        assert!(!is_type_archive(FileType::Mov));
         assert!(!is_type_archive(FileType::TS));
         assert!(!is_type_archive(FileType::Unknown));
     }
@@ -256,6 +261,7 @@ mod tests {
     #[test]
     fn is_type_video_covers_video_variants() {
         assert!(is_type_video(FileType::Mp4));
+        assert!(is_type_video(FileType::Mov));
         assert!(is_type_video(FileType::TS));
         assert!(!is_type_video(FileType::Zip));
         assert!(!is_type_video(FileType::Unknown));
@@ -277,6 +283,7 @@ mod tests {
         assert!(!is_type_document(FileType::Multi));
         assert!(!is_type_document(FileType::Sfx));
         assert!(!is_type_document(FileType::Mp4));
+        assert!(!is_type_document(FileType::Mov));
         assert!(!is_type_document(FileType::TS));
         assert!(!is_type_document(FileType::Unknown));
     }
@@ -347,6 +354,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = write_file(&dir, "foo.rar", RAR4_MAGIC);
         assert_eq!(get_file_type(&p), FileType::Rar);
+    }
+
+    #[test]
+    fn quicktime_with_pdf_extension_is_mov() {
+        let dir = TempDir::new().unwrap();
+        let p = write_file(&dir, "disguised.pdf", QUICKTIME_MAGIC);
+        assert_eq!(get_file_type(&p), FileType::Mov);
     }
 
     // --- get_file_type: SFX detection ---------------------------------------

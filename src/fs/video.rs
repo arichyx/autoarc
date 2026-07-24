@@ -1,11 +1,11 @@
-//! Video file post-processing: enforce the canonical extension for MP4/TS files.
+//! Video file post-processing: enforce canonical MP4/MOV/TS extensions.
 
 use std::path::Path;
 
 use crate::error::AutoarcError;
 use crate::fs::{FileType, rename_noreplace};
 
-/// Rename `path` so its extension matches `file_type` (`.mp4` or `.ts`).
+/// Rename `path` so its extension matches `file_type` (`.mp4`, `.mov`, or `.ts`).
 ///
 /// This is a no-op if the extension already matches. Destination creation is
 /// atomic and never replaces a file that appears between validation and the
@@ -30,6 +30,7 @@ pub fn rename_video(path: &Path, file_type: FileType) -> Result<(), AutoarcError
 pub(crate) fn video_rename_target(path: &Path, file_type: FileType) -> Option<std::path::PathBuf> {
     let target_ext = match file_type {
         FileType::Mp4 => "mp4",
+        FileType::Mov => "mov",
         FileType::TS => "ts",
         _ => return None,
     };
@@ -74,5 +75,18 @@ mod tests {
 
         assert!(!source.exists());
         assert_eq!(std::fs::read(target).unwrap(), b"video");
+    }
+
+    #[test]
+    fn rename_changes_disguised_quicktime_extension_to_mov() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("clip.pdf");
+        let target = temp.path().join("clip.mov");
+        std::fs::write(&source, b"quicktime video").unwrap();
+
+        rename_video(&source, FileType::Mov).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(target).unwrap(), b"quicktime video");
     }
 }

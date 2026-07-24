@@ -239,7 +239,7 @@ just check         # one-shot: fmt-check + lint + release build
   filename (so `foo.zip` → `foo.zip_out/`, `foo.7z` → `foo.7z_out/`).
   Names that differ only by dots versus underscores remain distinct, and
   originals are never moved.
-- Detected videos (`.mp4`, `.ts`) inside archives get their extension corrected
+- Detected videos (`.mp4`, `.mov`, `.ts`) inside archives get their extension corrected
   in-place; audio / PDF / Office / text files are counted and reported but
   never modified
 
