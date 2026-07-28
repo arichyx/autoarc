@@ -2,7 +2,7 @@
 //!
 //! The reporter renders one progress bar per concurrent extraction task on top of an
 //! "overall" bar that tracks `done / total` archives. A coloured summary is printed
-//! when [`Reporter::finish_summary`] is called from the runner shutdown path.
+//! when [`Reporter::finish_summary`] is called after the task queue is exhausted.
 //!
 //! Tracing log output is rerouted through a custom writer that wraps every line in
 //! [`MultiProgress::suspend`], so log lines and live bars never tear each other.

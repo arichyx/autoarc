@@ -1,6 +1,6 @@
 [package]
 name = "autoarc"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 authors = ["arichyx <arichyx@qq.com>"]
 description = "A concurrent Rust CLI that extracts ZIP / RAR / 7z archives in place — including multi-volume splits, SFX .exe payloads, and password-protected sets. Requires the `unar` / `lsar` binaries at runtime."

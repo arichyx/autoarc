@@ -1,15 +1,16 @@
 //! Concurrent task runner that drives the extraction pipeline end-to-end.
 //!
-//! The runner enumerates initial archives, spawns one async task per work item, and
-//! recursively re-enqueues any nested archives discovered during extraction. A
-//! single [`Reporter`] coordinates the visual progress bars and aggregate stats.
+//! The runner enumerates initial archives and feeds them through a bounded task
+//! scheduler. Completed extractions add any nested archives back to the pending
+//! queue, while a single [`Reporter`] coordinates progress and aggregate stats.
 
+use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-use tokio::sync::{Notify, Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tracing::{debug, info};
 
 use crate::error::AutoarcError;
@@ -18,9 +19,9 @@ use crate::fs::{
     FileType, get_file_type, is_type_archive, is_type_document, is_type_video, relative_path,
     rename_video, video_rename_target,
 };
-use crate::progress::Reporter;
+use crate::progress::{Reporter, TaskReporter};
 
-/// One unit of work flowing through the channel.
+/// One archive extraction waiting to run.
 #[derive(Debug, Clone)]
 pub struct TaskParams {
     /// Path of the archive to extract.
@@ -131,144 +132,92 @@ pub async fn run(
     // Resolve the effective parallelism cap.
     let effective_jobs = resolve_jobs(jobs);
     info!("extracting with up to {effective_jobs} parallel job(s) (requested = {jobs}, 0 = auto)");
-    let jobs_sem = Arc::new(Semaphore::new(effective_jobs));
-
-    let (tx, mut rx) = mpsc::channel::<TaskParams>(32);
-    let active = Arc::new(AtomicUsize::new(0));
-    let all_done = Arc::new(Notify::new());
-    let shutdown = Arc::new(Notify::new());
-
-    // Consumer loop: spawns a per-task worker for every received TaskParams.
-    let consumer_tx = tx.clone();
-    let consumer_active = Arc::clone(&active);
-    let consumer_done = Arc::clone(&all_done);
-    let consumer_shutdown = Arc::clone(&shutdown);
-    let consumer_dir = dir.clone();
-    let consumer_reporter = reporter.clone();
-    let consumer_sem = Arc::clone(&jobs_sem);
-
-    let consumer_handle = tokio::spawn(async move {
-        info!("consumer started");
-        loop {
-            tokio::select! {
-                biased;
-
-                _ = consumer_shutdown.notified() => {
-                    info!("consumer received shutdown");
-                    break;
-                }
-
-                Some(task) = rx.recv() => {
-                    spawn_task(
-                        task,
-                        consumer_dir.clone(),
-                        consumer_tx.clone(),
-                        Arc::clone(&consumer_active),
-                        Arc::clone(&consumer_done),
-                        Arc::clone(&consumer_sem),
-                        consumer_reporter.clone(),
-                    );
-                }
-
-                else => {
-                    info!("consumer channel closed");
-                    break;
-                }
+    run_task_queue(
+        initial_tasks,
+        &dir,
+        effective_jobs,
+        &reporter,
+        |task, task_reporter| {
+            let file_type = get_file_type(&task.archive_path);
+            let result = extractors::run(file_type, task.archive_path, task.root, &task_reporter);
+            if result.is_ok() {
+                task_reporter.finish_ok();
             }
-        }
-    });
+            result
+        },
+    )
+    .await;
+    info!("all tasks finished");
 
-    // Seed the channel with the initial tasks.
-    active.fetch_add(initial_tasks.len(), Ordering::SeqCst);
-    for task in initial_tasks {
-        if tx.send(task).await.is_err() {
-            active.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-    drop(tx);
-
-    all_done.notified().await;
-    info!("all tasks finished; signalling shutdown");
-    shutdown.notify_waiters();
-
-    let consumer_error = consumer_handle.await.err();
     let failed = reporter.finish_summary();
 
-    if let Some(error) = consumer_error {
-        return Err(AutoarcError::Other(format!("consumer task failed: {error}")).into());
-    }
     if failed > 0 {
         return Err(AutoarcError::Other(format!("{failed} archive task(s) failed")).into());
     }
     Ok(())
 }
 
-/// Spawn a single async worker that runs the extractor on a blocking thread.
-fn spawn_task(
-    task: TaskParams,
-    dir: PathBuf,
-    tx: mpsc::Sender<TaskParams>,
-    active: Arc<AtomicUsize>,
-    all_done: Arc<Notify>,
-    jobs_sem: Arc<Semaphore>,
-    reporter: Reporter,
-) {
-    let label = task.display(&dir);
-    let task_reporter = reporter.task(label.clone());
+/// Drive a dynamically growing work queue with at most `jobs` blocking tasks.
+///
+/// The scheduler owns both lifecycle states: `pending` contains work that has
+/// not started, and `running` contains every spawned task. A completed task may
+/// return more work, which is appended to `pending`. The queue is exhausted
+/// exactly when both collections are empty, so no auxiliary counters or
+/// shutdown notifications are needed.
+async fn run_task_queue<F>(
+    initial_tasks: Vec<TaskParams>,
+    dir: &Path,
+    jobs: NonZeroUsize,
+    reporter: &Reporter,
+    worker: F,
+) where
+    F: Fn(TaskParams, TaskReporter) -> Result<Vec<TaskParams>> + Send + Sync + 'static,
+{
+    let mut pending: VecDeque<_> = initial_tasks.into();
+    let mut running = JoinSet::new();
+    let mut labels = HashMap::new();
+    let worker = Arc::new(worker);
 
-    tokio::spawn(async move {
-        // Hold a semaphore permit across the entire blocking extraction so no
-        // more than `--jobs` archives compete for CPU / disk / the blocking
-        // thread pool at once. The permit is released when `_permit` drops at
-        // the end of this task.
-        let _permit = match jobs_sem.acquire_owned().await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("semaphore closed unexpectedly: {e}");
-                reporter.task_failed(&label, &e);
-                if active.fetch_sub(1, Ordering::SeqCst) == 1 {
-                    all_done.notify_one();
-                }
-                return;
-            }
+    while !pending.is_empty() || !running.is_empty() {
+        while running.len() < jobs.get() {
+            let Some(task) = pending.pop_front() else {
+                break;
+            };
+
+            let label = task.display(dir);
+            let task_reporter = reporter.task(label.clone());
+            let worker = Arc::clone(&worker);
+            let handle = running.spawn_blocking(move || worker(task, task_reporter));
+            let previous_label = labels.insert(handle.id(), label);
+            debug_assert!(previous_label.is_none());
+        }
+
+        let completed = running
+            .join_next_with_id()
+            .await
+            .expect("non-empty task set must yield a completion");
+        let task_id = match &completed {
+            Ok((task_id, _)) => *task_id,
+            Err(error) => error.id(),
         };
+        let label = labels
+            .remove(&task_id)
+            .unwrap_or_else(|| format!("archive task {task_id}"));
 
-        let archive_path = task.archive_path.clone();
-        let root = task.root.clone();
-        let file_type = get_file_type(&archive_path);
-
-        let extract_result = tokio::task::spawn_blocking(move || {
-            extractors::run(file_type, archive_path, root, &task_reporter).inspect(|_children| {
-                task_reporter.finish_ok();
-            })
-        })
-        .await;
-
-        match extract_result {
-            Ok(Ok(new_tasks)) => {
+        match completed {
+            Ok((_, Ok(new_tasks))) => {
                 reporter.task_succeeded();
                 if !new_tasks.is_empty() {
                     reporter.task_added(new_tasks.len());
-                    for new_task in new_tasks {
-                        active.fetch_add(1, Ordering::SeqCst);
-                        if tx.send(new_task).await.is_err() {
-                            active.fetch_sub(1, Ordering::SeqCst);
-                        }
-                    }
+                    pending.extend(new_tasks);
                 }
             }
-            Ok(Err(e)) => {
-                reporter.task_failed(&label, &e);
-            }
-            Err(e) => {
-                reporter.task_failed(&label, &e);
-            }
+            Ok((_, Err(error))) => reporter.task_failed(&label, &error),
+            Err(error) => reporter.task_failed(&label, &error),
         }
+    }
 
-        if active.fetch_sub(1, Ordering::SeqCst) == 1 {
-            all_done.notify_one();
-        }
-    });
+    debug_assert!(labels.is_empty());
 }
 
 // ============================================================================
@@ -281,19 +230,18 @@ fn spawn_task(
 /// 2. Otherwise fall back to [`std::thread::available_parallelism`].
 /// 3. If even that fails, use a hard-coded `4`.
 ///
-/// The returned value is guaranteed to be `>= 1` so that callers can hand it
-/// straight to `Semaphore::new` without additional bounds checks.
+/// The non-zero return type makes the scheduler's progress invariant explicit:
+/// whenever pending work exists, at least one task can be spawned.
 ///
 /// Parallelism is deliberately **not** configurable through an environment
 /// variable: it's a per-invocation tuning knob (unlike persistent secrets
 /// such as `AUTOARC_PASSWORDS`), so it lives on the CLI only.
-fn resolve_jobs(cli_jobs: usize) -> usize {
-    if cli_jobs > 0 {
-        return cli_jobs;
+fn resolve_jobs(cli_jobs: usize) -> NonZeroUsize {
+    if let Some(jobs) = NonZeroUsize::new(cli_jobs) {
+        return jobs;
     }
     std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+        .unwrap_or_else(|_| NonZeroUsize::new(4).expect("fallback parallelism is non-zero"))
 }
 
 // ============================================================================
@@ -793,26 +741,35 @@ fn execute(plan: Vec<PlanItem>, videos: Vec<(PathBuf, FileType)>) -> Result<Vec<
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    fn task(name: impl Into<PathBuf>) -> TaskParams {
+        let archive_path = name.into();
+        TaskParams {
+            root: archive_path.clone(),
+            archive_path,
+        }
+    }
 
     // --- resolve_jobs --------------------------------------------------------
 
     #[test]
     fn resolve_jobs_returns_cli_value_verbatim_when_positive() {
-        assert_eq!(resolve_jobs(1), 1);
-        assert_eq!(resolve_jobs(3), 3);
-        assert_eq!(resolve_jobs(99), 99);
+        assert_eq!(resolve_jobs(1).get(), 1);
+        assert_eq!(resolve_jobs(3).get(), 3);
+        assert_eq!(resolve_jobs(99).get(), 99);
     }
 
     #[test]
     fn resolve_jobs_zero_falls_back_to_available_parallelism() {
         let n = resolve_jobs(0);
-        assert!(n >= 1, "auto fallback must yield >= 1, got {n}");
         // Must match what std reports directly since that's the documented
         // auto-path.
-        let expected = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let expected =
+            std::thread::available_parallelism().unwrap_or_else(|_| NonZeroUsize::new(4).unwrap());
         assert_eq!(n, expected);
     }
 
@@ -823,13 +780,133 @@ mod tests {
         // var is set to something silly, the CLI path must still win.
         // SAFETY: single-threaded set_var is fine for this short assertion.
         unsafe { std::env::set_var("AUTOARC_JOBS", "999") };
-        assert_eq!(resolve_jobs(2), 2, "CLI flag must override any env var");
+        assert_eq!(
+            resolve_jobs(2).get(),
+            2,
+            "CLI flag must override any env var"
+        );
         let auto = resolve_jobs(0);
         assert_ne!(
-            auto, 999,
+            auto.get(),
+            999,
             "auto path must not read AUTOARC_JOBS (saw 999, that's the env leak)"
         );
         unsafe { std::env::remove_var("AUTOARC_JOBS") };
+    }
+
+    // --- bounded task scheduler ---------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn task_queue_never_exceeds_job_limit() {
+        const JOBS: usize = 3;
+        const TASKS: usize = 18;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let reporter = Reporter::new(TASKS);
+        let tasks = (0..TASKS)
+            .map(|index| task(format!("{index}.zip")))
+            .collect();
+
+        let active_for_worker = Arc::clone(&active);
+        let max_for_worker = Arc::clone(&max_active);
+        let completed_for_worker = Arc::clone(&completed);
+        run_task_queue(
+            tasks,
+            Path::new("."),
+            NonZeroUsize::new(JOBS).unwrap(),
+            &reporter,
+            move |_task, _task_reporter| {
+                let now = active_for_worker.fetch_add(1, Ordering::SeqCst) + 1;
+                max_for_worker.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                active_for_worker.fetch_sub(1, Ordering::SeqCst);
+                completed_for_worker.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+        )
+        .await;
+
+        assert_eq!(completed.load(Ordering::SeqCst), TASKS);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(max_active.load(Ordering::SeqCst), JOBS);
+        assert_eq!(reporter.finish_summary(), 0);
+    }
+
+    #[tokio::test]
+    async fn task_queue_processes_nested_tasks_and_terminates() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_worker = Arc::clone(&seen);
+        let reporter = Reporter::new(1);
+
+        let run = run_task_queue(
+            vec![task("root.zip")],
+            Path::new("."),
+            NonZeroUsize::new(2).unwrap(),
+            &reporter,
+            move |task, _task_reporter| {
+                let name = task
+                    .archive_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                seen_for_worker.lock().unwrap().push(name.clone());
+
+                if name == "root.zip" {
+                    Ok(vec![
+                        TaskParams {
+                            archive_path: PathBuf::from("child-a.7z"),
+                            root: task.root.clone(),
+                        },
+                        TaskParams {
+                            archive_path: PathBuf::from("child-b.rar"),
+                            root: task.root,
+                        },
+                    ])
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("dynamic queue should terminate without a separate shutdown signal");
+
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, ["child-a.7z", "child-b.rar", "root.zip"]);
+        assert_eq!(reporter.finish_summary(), 0);
+    }
+
+    #[tokio::test]
+    async fn task_queue_reports_panics_without_stranding_other_work() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_for_worker = Arc::clone(&completed);
+        let reporter = Reporter::new(2);
+
+        let run = run_task_queue(
+            vec![task("panic.zip"), task("ok.zip")],
+            Path::new("."),
+            NonZeroUsize::new(2).unwrap(),
+            &reporter,
+            move |task, _task_reporter| {
+                if task.archive_path == Path::new("panic.zip") {
+                    panic!("synthetic worker panic");
+                }
+                completed_for_worker.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("a worker panic must not strand the task queue");
+
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert_eq!(reporter.finish_summary(), 1);
     }
 
     // --- has_ext -------------------------------------------------------------
