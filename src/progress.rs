@@ -24,6 +24,11 @@ struct Stats {
     succeeded: usize,
     failed: usize,
     videos_renamed: usize,
+    /// Media tails carved out into standalone archive files.
+    tails_carved: usize,
+    /// Real PE executables seen among extracted/scanned files. Reported only;
+    /// autoarc never executes them.
+    executables: usize,
 }
 
 /// Top-level progress reporter shared across the runner and every extraction task.
@@ -114,6 +119,20 @@ impl Reporter {
         }
     }
 
+    /// Increment the carved-media-tail counter (used by the tail extractor).
+    pub fn note_tail_carved(&self) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.tails_carved += 1;
+        }
+    }
+
+    /// Increment the detected-executable counter (used by extractors + scan).
+    pub fn note_executable(&self) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.executables += 1;
+        }
+    }
+
     /// Borrow the underlying [`MultiProgress`] (for the tracing writer).
     pub fn multi(&self) -> &MultiProgress {
         &self.multi
@@ -135,7 +154,7 @@ impl Reporter {
         let neutral = Style::new().cyan();
 
         let summary = format!(
-            "\n{}\n  {} {}\n  {} {}\n  {} {}\n  {} {:.2?}\n",
+            "\n{}\n  {} {}\n  {} {}\n  {} {}\n  {} {}\n  {} {}\n  {} {:.2?}\n",
             label.apply_to("Summary"),
             ok.apply_to("succeeded :"),
             stats.succeeded,
@@ -143,6 +162,10 @@ impl Reporter {
             stats.failed,
             neutral.apply_to("videos    :"),
             stats.videos_renamed,
+            neutral.apply_to("tails     :"),
+            stats.tails_carved,
+            neutral.apply_to("executables:"),
+            stats.executables,
             label.apply_to("elapsed   :"),
             elapsed,
         );
@@ -183,9 +206,28 @@ impl TaskReporter {
         self.bar.set_message(self.label.clone());
     }
 
+    /// Switch to a determinate bar whose progress is byte-based, rendered with
+    /// human-readable sizes (used when carving multi-gigabyte tails).
+    pub fn set_length_bytes(&self, total: u64) {
+        self.bar.set_style(
+            ProgressStyle::with_template(
+                "{prefix:>10.yellow} [{bar:32.green/blue}] {bytes}/{total_bytes} {wide_msg}",
+            )
+            .expect("valid task bar template")
+            .progress_chars("=> "),
+        );
+        self.bar.set_length(total);
+        self.bar.set_message(self.label.clone());
+    }
+
     /// Advance the bar by one entry.
     pub fn inc(&self) {
         self.bar.inc(1);
+    }
+
+    /// Set the absolute bar position (e.g. bytes copied so far).
+    pub fn set_position(&self, pos: u64) {
+        self.bar.set_position(pos);
     }
 
     /// Manual spinner tick (for extractors that don't know the entry count).
@@ -202,6 +244,20 @@ impl TaskReporter {
     pub fn note_video_renamed(&self) {
         if let Ok(mut s) = self.stats.lock() {
             s.videos_renamed += 1;
+        }
+    }
+
+    /// Increment the carved-media-tail stat.
+    pub fn note_tail_carved(&self) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.tails_carved += 1;
+        }
+    }
+
+    /// Increment the detected-executable stat (reported only, never executed).
+    pub fn note_executable(&self) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.executables += 1;
         }
     }
 
@@ -296,6 +352,8 @@ impl CloneIntoOwned for Stats {
             succeeded: self.succeeded,
             failed: self.failed,
             videos_renamed: self.videos_renamed,
+            tails_carved: self.tails_carved,
+            executables: self.executables,
         }
     }
 }

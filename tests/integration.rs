@@ -105,6 +105,46 @@ fn zip_with_password_extracts_with_correct_password() {
 }
 
 // ============================================================================
+// WinZip AES-256 encrypted zip (compression method 99, extra field 0x9901)
+// ============================================================================
+
+#[test]
+fn aes_zip_rejects_wrong_password_as_bad_password() {
+    // The password loop can only advance when a wrong AES password maps to
+    // BadPassword rather than a hard error (the AES verifier fails inside
+    // `by_index_decrypt`, unlike ZipCrypto's check-byte path).
+    let td = tempdir();
+    let archive = copy_fixture(&td, "single_aes.zip");
+
+    let outcome = ZipExtractor::try_extract(&archive, "not-the-password", &reporter()).unwrap();
+    assert!(
+        matches!(outcome, ExtractOutcome::BadPassword),
+        "wrong AES password must map to BadPassword, got {outcome:?}",
+    );
+}
+
+#[test]
+fn aes_zip_rejects_empty_attempt() {
+    let td = tempdir();
+    let archive = copy_fixture(&td, "single_aes.zip");
+
+    let outcome = ZipExtractor::try_extract(&archive, "", &reporter()).unwrap();
+    assert!(matches!(outcome, ExtractOutcome::BadPassword));
+}
+
+#[test]
+fn aes_zip_extracts_with_correct_password() {
+    let td = tempdir();
+    let archive = copy_fixture(&td, "single_aes.zip");
+
+    let outcome = ZipExtractor::try_extract(&archive, "secret", &reporter()).unwrap();
+    assert!(matches!(outcome, ExtractOutcome::Success(_)));
+
+    let out = td.path().join("single_aes.zip_out/hello.txt");
+    assert_eq!(fs::read_to_string(out).unwrap(), HELLO_TXT);
+}
+
+// ============================================================================
 // Nested: outer zip("outer") wraps inner 7z("inner") wraps hello.txt
 // ============================================================================
 

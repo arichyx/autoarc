@@ -8,7 +8,8 @@ use tracing::{debug, error, trace};
 
 use crate::error::AutoarcError;
 use crate::fs::{
-    get_file_type, is_type_archive, is_type_video, out_dir_path, rename_noreplace, rename_video,
+    get_file_type, is_type_archive, is_type_executable, is_type_video, out_dir_path,
+    rename_noreplace, rename_video,
 };
 use crate::progress::TaskReporter;
 
@@ -105,6 +106,8 @@ impl Extractor for UnarExtractor {
             } else if is_type_video(kind) {
                 rename_video(&filepath, kind)?;
                 reporter.note_video_renamed();
+            } else if is_type_executable(kind) {
+                reporter.note_executable();
             }
             reporter.tick();
         }

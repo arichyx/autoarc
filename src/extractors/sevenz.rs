@@ -9,7 +9,9 @@ use sevenz_rust2::{ArchiveEntry, ArchiveReader, Error as SevenzError, Password};
 use tracing::debug;
 
 use crate::error::AutoarcError;
-use crate::fs::{create_outpath, get_file_type, is_type_archive, is_type_video, rename_video};
+use crate::fs::{
+    create_outpath, get_file_type, is_type_archive, is_type_executable, is_type_video, rename_video,
+};
 use crate::progress::TaskReporter;
 
 use super::{ExtractOutcome, Extractor};
@@ -138,6 +140,8 @@ fn sevenz_with_password(
                 // Bubble the video-rename error up via the closure's io::Error channel.
                 rename_video(&outpath, kind).map_err(|e| std::io::Error::other(e.to_string()))?;
                 reporter.note_video_renamed();
+            } else if is_type_executable(kind) {
+                reporter.note_executable();
             }
         }
         Ok(true)

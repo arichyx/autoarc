@@ -18,7 +18,22 @@ async fn main() -> Result<()> {
         Some(Commands::Type { filepath }) => {
             let mime = infer::get_from_path(&filepath);
             println!("MIME: {mime:?}");
-            println!("type: {:?}", get_file_type(&filepath));
+            let kind = get_file_type(&filepath);
+            println!("type: {kind:?}");
+            if kind == autoarc::fs::FileType::Mp4Tail
+                && let Some(info) = autoarc::fs::media_tail_info(&filepath)
+            {
+                println!(
+                    "tail : {} payload, {} bytes at offset {} ({} host)",
+                    info.kind.tag(),
+                    info.tail_len,
+                    info.tail_start,
+                    match info.host {
+                        autoarc::fs::FileType::Mov => "mov",
+                        _ => "mp4",
+                    }
+                );
+            }
         }
         Some(Commands::Lsar { filepath }) => {
             for entry in lsar(&filepath)? {

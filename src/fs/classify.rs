@@ -9,7 +9,7 @@ use std::path::Path;
 const SFX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 
 /// High-level classification of a single file.
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum FileType {
     /// Single-volume ZIP archive.
     Zip,
@@ -31,6 +31,15 @@ pub enum FileType {
     /// 7z / RAR / ZIP payload appended after the stub. Also handled by the
     /// `unar` subprocess backend, which transparently skips the PE prefix.
     Sfx,
+    /// A media file with an appended payload: a fully playable ISO-BMFF
+    /// video (MP4 / MOV / M4V) whose box chain ends before EOF, with an
+    /// independent payload appended behind it — a ZIP / RAR / 7z archive, or
+    /// an SFX executable. The tail is carved out and processed as a normal
+    /// archive while the host file is left untouched.
+    Mp4Tail,
+    /// A genuine Windows PE executable (MZ header, no embedded archive).
+    /// autoarc never executes or extracts these — they are reported only.
+    Exe,
     /// MP3 / FLAC / OGG / WAV / AAC / M4A — any recognised audio container.
     Audio,
     /// Portable Document Format.
@@ -89,8 +98,10 @@ pub fn get_file_type(path: &Path) -> FileType {
                 }
             }
             // --- videos -------------------------------------------------
-            "video/mp4" | "video/x-m4v" => FileType::Mp4,
-            "video/quicktime" => FileType::Mov,
+            // ISO-BMFF videos may carry an archive appended after the box
+            // chain; detect that before settling on the plain video type.
+            "video/mp4" | "video/x-m4v" => detect_media_tail(path).unwrap_or(FileType::Mp4),
+            "video/quicktime" => detect_media_tail(path).unwrap_or(FileType::Mov),
             // --- audio --------------------------------------------------
             "audio/mpeg" | "audio/aac" | "audio/x-flac" | "audio/flac" | "audio/ogg"
             | "audio/wav" | "audio/x-wav" | "audio/x-aiff" | "audio/m4a" | "audio/midi"
@@ -110,13 +121,21 @@ pub fn get_file_type(path: &Path) -> FileType {
             // --- SFX ----------------------------------------------------
             "application/vnd.microsoft.portable-executable" => {
                 // Likely an SFX — scan the body for a payload signature.
-                detect_sfx(path).unwrap_or(FileType::Unknown)
+                // A PE without one is a genuine executable: reported only,
+                // never processed.
+                detect_sfx(path).unwrap_or(FileType::Exe)
             }
             _ => FileType::Unknown,
         },
         Ok(None) => detect_via_file_cmd(path).unwrap_or(FileType::Unknown),
         Err(_) => FileType::Unknown,
     }
+}
+
+/// Upgrade an ISO-BMFF video classification to [`FileType::Mp4Tail`] when an
+/// archive is appended behind the box chain (see [`crate::fs::mp4`]).
+fn detect_media_tail(path: &Path) -> Option<FileType> {
+    super::mp4::media_tail_info(path).map(|_| FileType::Mp4Tail)
 }
 
 /// Search the first [`SFX_SCAN_BYTES`] of `path` for a 7z / RAR / ZIP magic
@@ -184,13 +203,24 @@ fn detect_via_file_cmd(path: &Path) -> Option<FileType> {
 pub fn is_type_archive(t: FileType) -> bool {
     matches!(
         t,
-        FileType::Zip | FileType::Rar | FileType::SevenZ | FileType::Multi | FileType::Sfx
+        FileType::Zip
+            | FileType::Rar
+            | FileType::SevenZ
+            | FileType::Multi
+            | FileType::Sfx
+            | FileType::Mp4Tail
     )
 }
 
 /// Returns `true` for the video formats the pipeline can post-process.
 pub fn is_type_video(t: FileType) -> bool {
     matches!(t, FileType::Mp4 | FileType::Mov | FileType::TS)
+}
+
+/// Returns `true` for Windows PE executables. These are never executed,
+/// extracted, or enqueued — the pipeline only surfaces them to the user.
+pub fn is_type_executable(t: FileType) -> bool {
+    matches!(t, FileType::Exe)
 }
 
 /// Returns `true` for the non-archive, non-video media formats the scanner
@@ -252,9 +282,11 @@ mod tests {
         assert!(is_type_archive(FileType::SevenZ));
         assert!(is_type_archive(FileType::Multi));
         assert!(is_type_archive(FileType::Sfx));
+        assert!(is_type_archive(FileType::Mp4Tail));
         assert!(!is_type_archive(FileType::Mp4));
         assert!(!is_type_archive(FileType::Mov));
         assert!(!is_type_archive(FileType::TS));
+        assert!(!is_type_archive(FileType::Exe));
         assert!(!is_type_archive(FileType::Unknown));
     }
 
@@ -282,10 +314,21 @@ mod tests {
         assert!(!is_type_document(FileType::SevenZ));
         assert!(!is_type_document(FileType::Multi));
         assert!(!is_type_document(FileType::Sfx));
+        assert!(!is_type_document(FileType::Mp4Tail));
         assert!(!is_type_document(FileType::Mp4));
         assert!(!is_type_document(FileType::Mov));
         assert!(!is_type_document(FileType::TS));
+        assert!(!is_type_document(FileType::Exe));
         assert!(!is_type_document(FileType::Unknown));
+    }
+
+    #[test]
+    fn is_type_executable_covers_only_real_pe_files() {
+        assert!(is_type_executable(FileType::Exe));
+        assert!(!is_type_executable(FileType::Sfx)); // SFX archives are extracted
+        assert!(!is_type_executable(FileType::Mp4Tail));
+        assert!(!is_type_executable(FileType::Zip));
+        assert!(!is_type_executable(FileType::Unknown));
     }
 
     #[test]
@@ -359,7 +402,7 @@ mod tests {
     #[test]
     fn quicktime_with_pdf_extension_is_mov() {
         let dir = TempDir::new().unwrap();
-        let p = write_file(&dir, "disguised.pdf", QUICKTIME_MAGIC);
+        let p = write_file(&dir, "misleading.pdf", QUICKTIME_MAGIC);
         assert_eq!(get_file_type(&p), FileType::Mov);
     }
 
@@ -396,12 +439,74 @@ mod tests {
     }
 
     #[test]
-    fn pe_without_archive_payload_is_unknown() {
+    fn pe_without_archive_payload_is_exe() {
         let dir = TempDir::new().unwrap();
         let mut body = PE_STUB.to_vec();
         body.extend_from_slice(&[0xAAu8; 1024]); // no archive magic anywhere
         let p = write_file(&dir, "harmless.exe", &body);
-        assert_eq!(get_file_type(&p), FileType::Unknown);
+        assert_eq!(get_file_type(&p), FileType::Exe);
+    }
+
+    // --- get_file_type: media tails ---------------------------------
+
+    /// ftyp(isom) + free + mdat + moov — a minimal legal ISO-BMFF chain. The
+    /// contents are never decoded; only the box sizes/types are walked.
+    fn minimal_mp4_bytes() -> Vec<u8> {
+        fn boxed(btype: &[u8], payload: &[u8]) -> Vec<u8> {
+            let mut out = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(btype);
+            out.extend_from_slice(payload);
+            out
+        }
+        let mut out = boxed(b"ftyp", b"isom\x00\x00\x00\x00isom");
+        out.extend(boxed(b"free", b""));
+        out.extend(boxed(b"mdat", b"0123456789abcdef"));
+        out.extend(boxed(b"moov", b"mvhdFaked"));
+        out
+    }
+
+    #[test]
+    fn mp4_with_appended_zip_is_mp4tail() {
+        let dir = TempDir::new().unwrap();
+        let mut body = minimal_mp4_bytes();
+        body.extend_from_slice(ZIP_MAGIC);
+        body.extend_from_slice(b"payload bytes");
+        let p = write_file_raw(&dir, "host.mp4", &body);
+        assert_eq!(get_file_type(&p), FileType::Mp4Tail);
+    }
+
+    #[test]
+    fn mov_with_appended_rar_is_mp4tail() {
+        let dir = TempDir::new().unwrap();
+        // QUICKTIME_MAGIC is a complete 20-byte ftyp box; finish the chain
+        // with an mdat and a moov box, then append the RAR signature.
+        let mut body = QUICKTIME_MAGIC.to_vec();
+        body.extend_from_slice(&[0x00, 0x00, 0x00, 0x0C]);
+        body.extend_from_slice(b"mdat");
+        body.extend_from_slice(b"ok");
+        body.extend_from_slice(&[0x00, 0x00, 0x00, 0x0C]);
+        body.extend_from_slice(b"moov");
+        body.extend_from_slice(b"ok");
+        body.extend_from_slice(RAR4_MAGIC);
+        body.extend_from_slice(&[0u8; 32]);
+        let p = write_file_raw(&dir, "host.mov", &body);
+        assert_eq!(get_file_type(&p), FileType::Mp4Tail);
+    }
+
+    #[test]
+    fn mp4_with_junk_tail_stays_mp4() {
+        let dir = TempDir::new().unwrap();
+        let mut body = minimal_mp4_bytes();
+        body.extend_from_slice(&[0xEEu8; 100]);
+        let p = write_file_raw(&dir, "mostly-video.mp4", &body);
+        assert_eq!(get_file_type(&p), FileType::Mp4);
+    }
+
+    #[test]
+    fn clean_minimal_mp4_is_mp4() {
+        let dir = TempDir::new().unwrap();
+        let p = write_file_raw(&dir, "clean.mp4", &minimal_mp4_bytes());
+        assert_eq!(get_file_type(&p), FileType::Mp4);
     }
 
     // --- get_file_type: documents ------------------------------------------

@@ -16,6 +16,7 @@ use crate::runner::TaskParams;
 
 pub mod rar;
 pub mod sevenz;
+pub mod tail;
 pub mod unar;
 pub mod zip;
 
@@ -74,12 +75,37 @@ pub fn run(
     let passwords = get_password_list();
     let children = match file_type {
         FileType::Zip => try_with_passwords::<zip::ZipExtractor>(&path, passwords, reporter)?,
-        FileType::Rar => try_with_passwords::<rar::RarExtractor>(&path, passwords, reporter)?,
+        FileType::Rar => {
+            match try_with_passwords::<rar::RarExtractor>(&path, passwords, reporter) {
+                Ok(children) => children,
+                Err(error) if rar::should_fallback_to_unar(&error) => {
+                    // The bundled unrar library can't deal with this data (e.g. a
+                    // compression method newer than it knows). One retry through
+                    // the `unar` subprocess, which ships its own decoder.
+                    // Note: if the native backend already wrote a partial
+                    // `<archive>_out/`, the unar backend refuses to clobber it —
+                    // that failure keeps the existing no-overwrite semantics.
+                    tracing::warn!(
+                        "native unrar backend failed for {} — retrying via unar subprocess: {error:#}",
+                        path.display()
+                    );
+                    try_with_passwords::<unar::UnarExtractor>(&path, passwords, reporter)?
+                }
+                Err(error) => return Err(error),
+            }
+        }
         FileType::SevenZ => {
             try_with_passwords::<sevenz::SevenzExtractor>(&path, passwords, reporter)?
         }
         FileType::Multi => try_with_passwords::<unar::UnarExtractor>(&path, passwords, reporter)?,
         FileType::Sfx => try_with_passwords::<unar::UnarExtractor>(&path, passwords, reporter)?,
+        // No password loop: the carve runs once and hands back the carved
+        // payload as the next task, which then goes through its own loop.
+        // A PE tail without an embedded archive is reported instead.
+        FileType::Mp4Tail => match tail::carve(&path, reporter)? {
+            tail::CarveOutcome::Archive(carved) => vec![carved],
+            tail::CarveOutcome::Executable => Vec::new(),
+        },
         unsupported => return Err(AutoarcError::UnsupportedFileType(unsupported).into()),
     };
     Ok(children

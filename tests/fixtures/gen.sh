@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Regenerate the test fixtures used by `tests/integration.rs`.
+# Regenerate the test fixtures used by `tests/integration.rs` and
+# `tests/media_tail.rs`.
 #
-# Requires: zip, 7z (Homebrew p7zip). Run from the repo root:
+# Requires: zip, 7z (7-Zip, for AES zips and 7z splits), rar (rarlab CLI,
+# for the RAR5 member of the media-tail chain). Run from the repo root:
 #     bash tests/fixtures/gen.sh
 #
 # Checks the produced files into git; tests load them directly from
 # `tests/fixtures/` so CI and local runs see identical bytes.
+#
+# Test passwords used below ("secret", "outer-aes") are placeholders for the
+# fixtures only — never real credentials.
 
 set -euo pipefail
 
@@ -15,8 +20,13 @@ cd "$(dirname "$0")"
 rm -f hello.txt \
       single_nopass.zip \
       single_pass.zip \
+      single_aes.zip \
       nested_pass.zip \
-      split.7z.001 split.7z.002 split.7z.003
+      media_tail_aes.mp4 \
+      media_tail_sfx.mp4 \
+      payload.exe \
+      payload_sfx.exe \
+      split.7z.0*
 
 # --- source plaintext -------------------------------------------------------
 # Small but recognisable content so tests can compare byte-for-byte.
@@ -47,4 +57,42 @@ rm -f inner.7z
 7z a -bd -bso0 -bsp0 -v1k split.7z bigfile.bin > /dev/null
 rm -f bigfile.bin
 
-ls -la *.zip *.7z.* hello.txt
+# --- 5. single-layer WinZip AES-256 zip, password "secret" ------------------
+7z a -bd -bso0 -bsp0 -tzip -mem=AES256 -psecret single_aes.zip hello.txt > /dev/null
+
+# --- 6. media files with appended tails -------------------------------------------------
+# Shared host media: a minimal but legal ISO-BMFF box chain (ftyp+free+mdat+moov;
+# playable structure, tiny fake payloads).
+printf '\x00\x00\x00\x1cftypisom\x00\x00\x00\x00isomiso2mp41\x00\x00\x00\x08free\x00\x00\x00\x18mdat0123456789abcdef\x00\x00\x00\x11moovmvhdFaked' > mini.mp4
+
+# 6a. archive tail:
+# media_tail_aes.mp4 = mini.mp4
+#   + AES-256 zip (password "outer-aes")
+#     + plain zip (inner_nopass.zip)
+#       + payload.exe — a RAR5 renamed to .exe (also committed standalone for
+#         the native-RAR and unar-fallback tests)
+#         + clip.movTRASH — a mini MP4 with a garbage suffix in its name
+cp mini.mp4 clip.movTRASH
+rar a -idq -ma5 payload.exe clip.movTRASH
+zip -q inner_nopass.zip payload.exe
+7z a -bd -bso0 -bsp0 -tzip -mem=AES256 -pouter-aes tail_aes.zip inner_nopass.zip > /dev/null
+rm -f inner_nopass.zip clip.movTRASH
+cat mini.mp4 tail_aes.zip > media_tail_aes.mp4
+rm -f tail_aes.zip
+
+# 6b. Windows-SFX tail (program stub + appended zip):
+# media_tail_sfx.mp4 = mini.mp4 + payload_sfx.exe, where payload_sfx.exe is a
+# PE program stub with a zip appended behind it. No Windows SFX module ships
+# with macOS zip/7z/rar, so the stub is written by hand (MZ + e_lfanew at
+# 0x3C + PE\0\0 — enough for PE detection; nothing ever runs it) and the appended
+# zip's entry offsets are fixed up with `zip -A`, the same post-processing
+# real SFX creators perform.
+{ printf 'MZ\x90\x00'; head -c 56 /dev/zero; printf '\x40\x00\x00\x00PE\x00\x00\x00'; head -c 200 /dev/zero; } > sfx_stub.bin
+cp mini.mp4 clip.movTRASH
+zip -q payload_inner.zip clip.movTRASH
+cat sfx_stub.bin payload_inner.zip > payload_sfx.exe
+zip -A -q payload_sfx.exe
+cat mini.mp4 payload_sfx.exe > media_tail_sfx.mp4
+rm -f sfx_stub.bin payload_inner.zip clip.movTRASH mini.mp4
+
+ls -la *.zip *.7z.* *.mp4 hello.txt

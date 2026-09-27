@@ -16,8 +16,8 @@ use tracing::{debug, info};
 use crate::error::AutoarcError;
 use crate::extractors;
 use crate::fs::{
-    FileType, get_file_type, is_type_archive, is_type_document, is_type_video, relative_path,
-    rename_video, video_rename_target,
+    FileType, get_file_type, is_type_archive, is_type_document, is_type_executable, is_type_video,
+    media_tail_info, relative_path, rename_video, video_rename_target,
 };
 use crate::progress::{Reporter, TaskReporter};
 
@@ -89,7 +89,11 @@ pub async fn run(
     // Phase 2 — plan: fuse multi-volume parts into single logical entries.
     let plan = build_plan(scan_result.archives);
 
-    if plan.is_empty() && scan_result.videos.is_empty() && scan_result.others.is_empty() {
+    if plan.is_empty()
+        && scan_result.videos.is_empty()
+        && scan_result.others.is_empty()
+        && scan_result.executables.is_empty()
+    {
         println!("No archives or media files found in {}", dir.display());
         return Ok(());
     }
@@ -99,6 +103,7 @@ pub async fn run(
         &plan,
         &scan_result.videos,
         &scan_result.others,
+        &scan_result.executables,
         &dir,
         max_depth,
     );
@@ -298,11 +303,13 @@ struct ScanItem {
 
 /// Outcome of [`scan`]: archives that need extraction + videos that need a
 /// rename + other recognised media (audio / pdf / office / text) that are
-/// merely reported to the user so the scan surface isn't purely video-centric.
+/// merely reported to the user so the scan surface isn't purely video-centric
+/// + real PE executables that are reported but never touched.
 struct ScanResult {
     archives: Vec<ScanItem>,
     videos: Vec<(PathBuf, FileType)>,
     others: Vec<(PathBuf, FileType)>,
+    executables: Vec<PathBuf>,
 }
 
 /// Walk `target_dir` (respecting `max_depth`) and classify every file.
@@ -323,6 +330,7 @@ fn scan_top_level(target_dir: &Path, ignore: &IgnoreFilter) -> Result<ScanResult
         archives: Vec::new(),
         videos: Vec::new(),
         others: Vec::new(),
+        executables: Vec::new(),
     };
 
     let entries =
@@ -343,6 +351,8 @@ fn scan_top_level(target_dir: &Path, ignore: &IgnoreFilter) -> Result<ScanResult
             result.videos.push((path, kind));
         } else if is_type_document(kind) {
             result.others.push((path, kind));
+        } else if is_type_executable(kind) {
+            result.executables.push(path);
         }
     }
     Ok(result)
@@ -361,6 +371,7 @@ fn scan_recursive(
         archives: Vec::new(),
         videos: Vec::new(),
         others: Vec::new(),
+        executables: Vec::new(),
     };
 
     let walker = WalkDir::new(target_dir)
@@ -396,6 +407,8 @@ fn scan_recursive(
             result.videos.push((path, kind));
         } else if is_type_document(kind) {
             result.others.push((path, kind));
+        } else if is_type_executable(kind) {
+            result.executables.push(path);
         }
     }
     Ok(result)
@@ -569,10 +582,12 @@ fn has_ext(path: &Path, ext: &str) -> bool {
 // ============================================================================
 
 /// Print a human-readable extraction plan to stdout.
+#[allow(clippy::too_many_arguments)]
 fn print_plan(
     plan: &[PlanItem],
     videos: &[(PathBuf, FileType)],
     others: &[(PathBuf, FileType)],
+    executables: &[PathBuf],
     dir: &Path,
     max_depth: usize,
 ) {
@@ -609,18 +624,41 @@ fn print_plan(
         .unwrap_or(0);
 
     for item in plan {
+        let rel = relative_path(dir, &item.primary);
+        let label = rel.to_string_lossy();
+        let pad = max_label.saturating_sub(label.chars().count());
+        let spacer = " ".repeat(pad);
+
+        // Media-tail rows get their own shape: the archive kind of the tail
+        // plus how many bytes will be carved out of the host file.
+        if get_file_type(&item.primary) == FileType::Mp4Tail
+            && let Some(info) = media_tail_info(&item.primary)
+        {
+            let host_tag = if info.host == FileType::Mov {
+                "mov"
+            } else {
+                "mp4"
+            };
+            println!(
+                "  [{}] {}{}  \u{2192} tail {} (of {})",
+                style(format!("{host_tag}+{}", info.kind.tag())).yellow(),
+                label,
+                spacer,
+                HumanBytes(info.tail_len),
+                HumanBytes(item.total_size),
+            );
+            continue;
+        }
+
         let kind_tag = match get_file_type(&item.primary) {
             FileType::Zip => "zip",
             FileType::Rar => "rar",
             FileType::SevenZ => "7z",
             FileType::Multi => "multi",
             FileType::Sfx => "sfx",
+            FileType::Mp4Tail => "media",
             _ => "?",
         };
-        let rel = relative_path(dir, &item.primary);
-        let label = rel.to_string_lossy();
-        let pad = max_label.saturating_sub(label.chars().count());
-        let spacer = " ".repeat(pad);
         let suffix = if item.is_multi_volume {
             format!(", {} parts", item.parts.len())
         } else {
@@ -667,6 +705,13 @@ fn print_plan(
             style("Note:").dim(),
             others.len(),
             breakdown.join(", "),
+        );
+    }
+    if !executables.is_empty() {
+        println!(
+            "{} {} executable file(s) detected \u{2014} reported only, never executed or extracted.",
+            style("Note:").dim(),
+            executables.len()
         );
     }
     println!();

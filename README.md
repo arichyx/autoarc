@@ -229,8 +229,14 @@ just check         # one-shot: fmt-check + lint + release build
 
 - Concurrent extraction powered by [`tokio`]
 - Native handling of `zip`, `rar`, and `7z`
-- Subprocess fallback to `unar` / `lsar` for split archives (`.z01`, `.001`)
-  and SFX `.exe` payloads
+- Subprocess fallback to `unar` / `lsar` for split archives (`.z01`, `.001`),
+  SFX `.exe` payloads, and RAR files the bundled library can't decode
+- **Appended-archive recovery**: some tools concatenate a playable MP4/MOV
+  with an independent ZIP / RAR / 7z archive or a Windows SFX executable
+  placed after the media box chain. autoarc parses the ISO-BMFF structure to
+  find where the media ends, streams the appended part out as
+  `<name>.tail.<ext>`, and extracts it, while the host media file is left
+  byte-for-byte untouched
 - Recursive: nested archives produced by extraction are queued automatically
 - Multi-password trial-and-error per archive (stops on first match)
 - Live `indicatif` progress bars + a coloured run summary
@@ -252,6 +258,7 @@ just check         # one-shot: fmt-check + lint + release build
 | `.7z`              | `sevenz_rust2`     |
 | `.z01`, `.001`     | `unar` subprocess  |
 | `.exe` (SFX)       | `unar` subprocess  |
+| `.mp4`/`.mov` + appended archive or SFX `.exe` | carved, then the matching backend |
 
 ## Behaviour
 
@@ -288,6 +295,18 @@ layout inside each directory is the same:
   extraction itself* are always queued recursively, regardless of `--depth`.
 - Multi-volume archives are handled as a single logical unit and extracted in
   place so their `.z02`, `.z03`, ... siblings remain reachable.
+- RAR extraction failures that look like an unsupported compression method or
+  damaged data are retried once through the `unar` subprocess before giving up.
+- Real PE executables (MZ header, no embedded archive) are never executed,
+  extracted, or enqueued — they are only counted and reported.
+- A media file carrying an appended payload keeps its original bytes; the
+  carved `<name>.tail.zip`/`.rar`/`.7z`/`.exe` sibling is what gets extracted
+  into its own `_out/` directory. Re-running after a successful carve fails
+  that task with an output collision instead of overwriting anything.
+- A PE tail is only carved when it is an SFX carrier (embedded archive found
+  behind the program stub). A genuine executable tail — or any real PE
+  extracted from an archive — is counted and reported, never written out,
+  enqueued, or executed.
 - Videos found during the scan are renamed in-place to enforce the canonical
   extension.
 - During recursive scans, directories named `*_out` are skipped to avoid

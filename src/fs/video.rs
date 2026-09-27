@@ -78,7 +78,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_changes_disguised_quicktime_extension_to_mov() {
+    fn rename_changes_misleading_quicktime_extension_to_mov() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("clip.pdf");
         let target = temp.path().join("clip.mov");

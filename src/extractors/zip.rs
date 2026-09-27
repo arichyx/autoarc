@@ -9,7 +9,9 @@ use tracing::debug;
 use zip::{ZipArchive, result::ZipError};
 
 use crate::error::AutoarcError;
-use crate::fs::{create_outpath, get_file_type, is_type_archive, is_type_video, rename_video};
+use crate::fs::{
+    create_outpath, get_file_type, is_type_archive, is_type_executable, is_type_video, rename_video,
+};
 use crate::progress::TaskReporter;
 
 use super::{ExtractOutcome, Extractor};
@@ -123,6 +125,8 @@ fn unzip_with_password(
         } else if is_type_video(kind) {
             rename_video(&outpath, kind)?;
             reporter.note_video_renamed();
+        } else if is_type_executable(kind) {
+            reporter.note_executable();
         }
     }
 
